@@ -1,6 +1,10 @@
 /**
  * pi-backtask — Background task + task-list workflow
  *
+ * This plugin uses gob (https://github.com/juanibiapina/gob) as the
+ * background-process backend for /bg commands.
+ *
+ * Non-intrusive by design: it never launches `gob tui` or fullscreen views.
  * Shortcuts:
  *   Ctrl+B  Toggle background tasks widget
  *   Ctrl+T  Toggle task-list footer
@@ -32,9 +36,7 @@ import * as path from "path";
 const { spawn } = require("child_process") as any;
 
 type TaskStatus = "pending" | "in_progress" | "completed";
-
 type BackgroundStatus = "running" | "completed" | "failed" | "killed";
-
 type BackgroundKind = "shell" | "agent";
 
 interface BackTaskItem {
@@ -54,13 +56,31 @@ interface BackgroundTask {
 	endedAt?: number;
 	exitCode?: number | null;
 	outputTail: string[];
-	proc?: any;
 	sessionFile?: string;
+	gobJobId?: string;
+	lastTailLine?: string;
+	lastTailReadAt?: number;
 }
 
 interface PersistedState {
 	nextTaskId: number;
 	tasks: BackTaskItem[];
+}
+
+interface ExecResult {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+}
+
+interface GobListJob {
+	id: string;
+	status: string;
+	command: string[];
+	description?: string;
+	created_at?: string;
+	started_at?: string;
+	exit_code?: number;
 }
 
 const STATUS_ICON: Record<TaskStatus, string> = {
@@ -119,6 +139,85 @@ function formatDuration(ms: number): string {
 	return `${min}m ${sec % 60}s`;
 }
 
+function parseId(arg: string): number | null {
+	const num = Number(arg);
+	if (!Number.isFinite(num)) return null;
+	const id = Math.trunc(num);
+	return id > 0 ? id : null;
+}
+
+function appendTail(bg: BackgroundTask, chunk: string) {
+	const lines = chunk
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (lines.length === 0) return;
+	bg.outputTail.push(...lines);
+	if (bg.outputTail.length > 20) {
+		bg.outputTail = bg.outputTail.slice(-20);
+	}
+}
+
+async function execCommand(command: string, args: string[], cwd: string): Promise<ExecResult> {
+	return new Promise((resolve) => {
+		const proc = spawn(command, args, {
+			cwd,
+			env: { ...process.env },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		let stdout = "";
+		let stderr = "";
+
+		proc.stdout?.setEncoding("utf-8");
+		proc.stderr?.setEncoding("utf-8");
+		proc.stdout?.on("data", (chunk: string) => {
+			stdout += chunk;
+		});
+		proc.stderr?.on("data", (chunk: string) => {
+			stderr += chunk;
+		});
+
+		proc.on("close", (code: number | null) => {
+			resolve({
+				exitCode: typeof code === "number" ? code : 1,
+				stdout,
+				stderr,
+			});
+		});
+
+		proc.on("error", (err: Error) => {
+			resolve({
+				exitCode: 1,
+				stdout,
+				stderr: `${stderr}\nspawn error: ${err.message}`.trim(),
+			});
+		});
+	});
+}
+
+function extractGobJobId(output: string): string | null {
+	const m = output.match(/\b(?:Added job|Job)\s+([A-Za-z0-9_-]+)\b/);
+	return m?.[1] || null;
+}
+
+function jobTimestamp(job: GobListJob): number {
+	const raw = job.started_at || job.created_at || "";
+	const ms = Date.parse(raw);
+	return Number.isFinite(ms) ? ms : 0;
+}
+
+function pickNewestNewJob(beforeIds: Set<string>, jobs: GobListJob[], hint: string): string | null {
+	const candidates = jobs
+		.filter((job) => !beforeIds.has(job.id))
+		.sort((a, b) => jobTimestamp(b) - jobTimestamp(a));
+	if (candidates.length === 0) return null;
+
+	const hintLower = hint.toLowerCase();
+	const hinted = candidates.find((job) => job.command.join(" ").toLowerCase().includes(hintLower));
+	return (hinted || candidates[0])?.id || null;
+}
+
 export default function (pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 
@@ -130,6 +229,11 @@ export default function (pi: ExtensionAPI) {
 
 	let showTaskFooter = true;
 	let showBackgroundWidget = false;
+
+	let gobAvailable: boolean | null = null;
+	let gobWarnedMissing = false;
+	let gobPollTimer: any;
+	let gobPollBusy = false;
 
 	function persist() {
 		writeState({ nextTaskId, tasks });
@@ -259,7 +363,7 @@ export default function (pi: ExtensionAPI) {
 												? "warning"
 												: "error";
 								const elapsed = formatDuration((task.endedAt || Date.now()) - task.startedAt);
-								const head = `${task.kind} #${task.id} ${task.status} (${elapsed})`;
+								const head = `${task.kind} #${task.id} ${task.status} (${elapsed})${task.gobJobId ? ` gob:${task.gobJobId}` : ""}`;
 								rows.push(theme.fg(statusColor, truncateToWidth(`  ${head}`, width - 2, "")));
 								if (task.outputTail.length > 0) {
 									const tail = task.outputTail[task.outputTail.length - 1] || "";
@@ -282,30 +386,10 @@ export default function (pi: ExtensionAPI) {
 		refreshBackgroundWidget(ctx);
 	}
 
-	function parseId(arg: string): number | null {
-		const num = Number(arg);
-		if (!Number.isFinite(num)) return null;
-		const id = Math.trunc(num);
-		return id > 0 ? id : null;
-	}
-
-	function appendTail(bg: BackgroundTask, chunk: string) {
-		const lines = chunk
-			.split(/\r?\n/)
-			.map((line) => line.trim())
-			.filter(Boolean);
-		if (lines.length === 0) return;
-		bg.outputTail.push(...lines);
-		if (bg.outputTail.length > 20) {
-			bg.outputTail = bg.outputTail.slice(-20);
-		}
-	}
-
 	function completeBackgroundTask(ctx: ExtensionContext, bg: BackgroundTask, status: BackgroundStatus, exitCode: number | null = null) {
 		bg.status = status;
 		bg.endedAt = Date.now();
 		bg.exitCode = exitCode;
-		bg.proc = undefined;
 		refreshAll(ctx);
 
 		const headline =
@@ -329,46 +413,190 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function spawnShellBackground(ctx: ExtensionContext, command: string) {
+	async function ensureGobInstalled(ctx: ExtensionContext): Promise<boolean> {
+		if (gobAvailable === true) return true;
+		if (gobAvailable === false) {
+			if (!gobWarnedMissing) {
+				ctx.ui.notify("gob CLI not found. Install: brew tap juanibiapina/taps && brew install gob", "error");
+				gobWarnedMissing = true;
+			}
+			return false;
+		}
+
+		const probe = await execCommand("gob", ["--version"], process.cwd());
+		gobAvailable = probe.exitCode === 0;
+		if (!gobAvailable && !gobWarnedMissing) {
+			ctx.ui.notify("gob CLI not found. Install: brew tap juanibiapina/taps && brew install gob", "error");
+			gobWarnedMissing = true;
+		}
+		return gobAvailable;
+	}
+
+	async function gobListJobs(): Promise<GobListJob[]> {
+		const result = await execCommand("gob", ["list", "--json"], process.cwd());
+		if (result.exitCode !== 0) {
+			throw new Error(result.stderr.trim() || result.stdout.trim() || "gob list failed");
+		}
+		const parsed = JSON.parse(result.stdout || "[]");
+		if (!Array.isArray(parsed)) {
+			throw new Error("gob list --json returned non-array output");
+		}
+		return parsed as GobListJob[];
+	}
+
+	function ensureSingleInProgress(ctx: ExtensionContext) {
+		const active = tasks.filter((t) => t.status === "in_progress");
+		if (active.length <= 1) return;
+		const keepId = active[active.length - 1]?.id;
+		for (const task of tasks) {
+			if (task.status === "in_progress" && task.id !== keepId) {
+				task.status = "pending";
+				task.updatedAt = nowIso();
+			}
+		}
+		ctx.ui.notify("Only one task can stay in progress; older active tasks moved to pending.", "warning");
+	}
+
+	async function syncBgTailFromGob(bg: BackgroundTask) {
+		if (!bg.gobJobId) return;
+		if (Date.now() - (bg.lastTailReadAt || 0) < 5000) return;
+		bg.lastTailReadAt = Date.now();
+
+		const result = await execCommand("gob", ["stdout", bg.gobJobId], process.cwd());
+		if (result.exitCode !== 0) return;
+		const lines = result.stdout
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter(Boolean);
+		const lastLine = lines[lines.length - 1];
+		if (!lastLine) return;
+		if (bg.lastTailLine === lastLine) return;
+		bg.lastTailLine = lastLine;
+		appendTail(bg, lastLine);
+	}
+
+	function stopGobPollingIfIdle() {
+		const stillRunning = Array.from(backgroundTasks.values()).some((bg) => bg.status === "running" && !!bg.gobJobId);
+		if (!stillRunning && gobPollTimer) {
+			clearInterval(gobPollTimer);
+			gobPollTimer = undefined;
+		}
+	}
+
+	async function pollGobBackgroundTasks(ctx: ExtensionContext) {
+		if (gobPollBusy) return;
+		const running = Array.from(backgroundTasks.values()).filter((bg) => bg.status === "running" && !!bg.gobJobId);
+		if (running.length === 0) {
+			stopGobPollingIfIdle();
+			return;
+		}
+
+		gobPollBusy = true;
+		try {
+			const jobs = await gobListJobs();
+			const byId = new Map(jobs.map((job) => [job.id, job]));
+
+			for (const bg of running) {
+				const job = byId.get(bg.gobJobId!);
+				if (!job) {
+					appendTail(bg, `gob job ${bg.gobJobId} not found`);
+					completeBackgroundTask(ctx, bg, bg.status === "killed" ? "killed" : "failed", bg.exitCode ?? null);
+					continue;
+				}
+
+				await syncBgTailFromGob(bg);
+
+				if (job.status !== "running") {
+					const exitCode = typeof job.exit_code === "number" ? job.exit_code : null;
+					const status = bg.status === "killed" ? "killed" : exitCode === 0 ? "completed" : "failed";
+					completeBackgroundTask(ctx, bg, status, exitCode);
+				}
+			}
+
+			refreshBackgroundWidget(ctx);
+		} catch (err: any) {
+			ctx.ui.notify(`gob sync failed: ${String(err?.message || err)}`, "error");
+		} finally {
+			gobPollBusy = false;
+			stopGobPollingIfIdle();
+		}
+	}
+
+	function ensureGobPolling(ctx: ExtensionContext) {
+		if (gobPollTimer) return;
+		gobPollTimer = setInterval(() => {
+			if (!ctxRef) return;
+			void pollGobBackgroundTasks(ctxRef);
+		}, 2000);
+		void pollGobBackgroundTasks(ctx);
+	}
+
+	async function spawnGobBackground(
+		ctx: ExtensionContext,
+		kind: BackgroundKind,
+		title: string,
+		description: string,
+		command: string,
+		args: string[],
+		sessionFile?: string
+	): Promise<BackgroundTask | null> {
 		const id = nextBgId++;
 		const bg: BackgroundTask = {
 			id,
-			kind: "shell",
-			title: command,
+			kind,
+			title,
 			status: "running",
 			startedAt: Date.now(),
 			outputTail: [],
+			sessionFile,
 		};
 		backgroundTasks.set(id, bg);
 		refreshAll(ctx);
 
-		const proc = spawn("bash", ["-lc", command], {
-			cwd: process.cwd(),
-			env: { ...process.env },
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		bg.proc = proc;
+		if (!(await ensureGobInstalled(ctx))) {
+			appendTail(bg, "gob CLI missing; cannot start background task");
+			completeBackgroundTask(ctx, bg, "failed", null);
+			return null;
+		}
 
-		proc.stdout?.setEncoding("utf-8");
-		proc.stderr?.setEncoding("utf-8");
-		proc.stdout?.on("data", (chunk: string) => {
-			appendTail(bg, chunk);
-			if (ctxRef) refreshBackgroundWidget(ctxRef);
-		});
-		proc.stderr?.on("data", (chunk: string) => {
-			appendTail(bg, chunk);
-			if (ctxRef) refreshBackgroundWidget(ctxRef);
-		});
-		proc.on("close", (code: number | null) => {
-			if (!ctxRef) return;
-			completeBackgroundTask(ctxRef, bg, code === 0 ? "completed" : "failed", code);
-		});
-		proc.on("error", (err: Error) => {
-			appendTail(bg, `spawn error: ${err.message}`);
-			if (!ctxRef) return;
-			completeBackgroundTask(ctxRef, bg, "failed", null);
-		});
+		let beforeIds = new Set<string>();
+		try {
+			const before = await gobListJobs();
+			beforeIds = new Set(before.map((job) => job.id));
+		} catch {
+			// best-effort: fallback to output parsing
+		}
 
+		const addArgs = ["add", "--description", description, "--", command, ...args];
+		const addResult = await execCommand("gob", addArgs, process.cwd());
+		if (addResult.exitCode !== 0) {
+			appendTail(bg, addResult.stderr || addResult.stdout || "gob add failed");
+			completeBackgroundTask(ctx, bg, "failed", addResult.exitCode);
+			return bg;
+		}
+
+		const output = `${addResult.stdout}\n${addResult.stderr}`;
+		let jobId = extractGobJobId(output);
+
+		if (!jobId) {
+			try {
+				const after = await gobListJobs();
+				jobId = pickNewestNewJob(beforeIds, after, `${command} ${args.join(" ")}`);
+			} catch {
+				// ignore fallback failure
+			}
+		}
+
+		if (!jobId) {
+			appendTail(bg, output || "unable to determine gob job id");
+			completeBackgroundTask(ctx, bg, "failed", null);
+			return bg;
+		}
+
+		bg.gobJobId = jobId;
+		appendTail(bg, `gob job ${jobId} started`);
+		refreshAll(ctx);
+		ensureGobPolling(ctx);
 		return bg;
 	}
 
@@ -378,23 +606,21 @@ export default function (pi: ExtensionAPI) {
 		return path.join(dir, `agent-${id}-${Date.now()}.jsonl`);
 	}
 
-	function spawnAgentBackground(ctx: ExtensionContext, prompt: string) {
-		const id = nextBgId++;
-		const sessionFile = makeAgentSessionFile(id);
-		const bg: BackgroundTask = {
-			id,
-			kind: "agent",
-			title: prompt,
-			status: "running",
-			startedAt: Date.now(),
-			outputTail: [],
-			sessionFile,
-		};
-		backgroundTasks.set(id, bg);
-		refreshAll(ctx);
+	async function spawnShellBackground(ctx: ExtensionContext, command: string) {
+		const description = `pi-backtask shell: ${command.slice(0, 120)}`;
+		return spawnGobBackground(ctx, "shell", command, description, "bash", ["-lc", command]);
+	}
 
+	async function spawnAgentBackground(ctx: ExtensionContext, prompt: string) {
+		const localId = nextBgId;
+		const sessionFile = makeAgentSessionFile(localId);
 		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "openrouter/google/gemini-3-flash-preview";
-		const proc = spawn(
+		const description = `pi-backtask agent: ${prompt.slice(0, 120)}`;
+		return spawnGobBackground(
+			ctx,
+			"agent",
+			prompt,
+			description,
 			"pi",
 			[
 				"--mode",
@@ -411,69 +637,8 @@ export default function (pi: ExtensionAPI) {
 				"off",
 				prompt,
 			],
-			{
-				cwd: process.cwd(),
-				env: { ...process.env },
-				stdio: ["ignore", "pipe", "pipe"],
-			}
+			sessionFile
 		);
-		bg.proc = proc;
-
-		let buffer = "";
-		proc.stdout?.setEncoding("utf-8");
-		proc.stdout?.on("data", (chunk: string) => {
-			buffer += chunk;
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) {
-				if (!line.trim()) continue;
-				try {
-					const event = JSON.parse(line);
-					if (event.type === "message_update") {
-						const delta = event.assistantMessageEvent;
-						if (delta?.type === "text_delta") {
-							appendTail(bg, String(delta.delta || ""));
-						}
-					}
-				} catch {
-					appendTail(bg, line);
-				}
-			}
-			if (ctxRef) refreshBackgroundWidget(ctxRef);
-		});
-
-		proc.stderr?.setEncoding("utf-8");
-		proc.stderr?.on("data", (chunk: string) => {
-			appendTail(bg, chunk);
-			if (ctxRef) refreshBackgroundWidget(ctxRef);
-		});
-
-		proc.on("close", (code: number | null) => {
-			if (!ctxRef) return;
-			if (buffer.trim()) appendTail(bg, buffer);
-			completeBackgroundTask(ctxRef, bg, code === 0 ? "completed" : "failed", code);
-		});
-
-		proc.on("error", (err: Error) => {
-			appendTail(bg, `spawn error: ${err.message}`);
-			if (!ctxRef) return;
-			completeBackgroundTask(ctxRef, bg, "failed", null);
-		});
-
-		return bg;
-	}
-
-	function ensureSingleInProgress(ctx: ExtensionContext) {
-		const active = tasks.filter((t) => t.status === "in_progress");
-		if (active.length <= 1) return;
-		const keepId = active[active.length - 1]?.id;
-		for (const task of tasks) {
-			if (task.status === "in_progress" && task.id !== keepId) {
-				task.status = "pending";
-				task.updatedAt = nowIso();
-			}
-		}
-		ctx.ui.notify("Only one task can stay in progress; older active tasks moved to pending.", "warning");
 	}
 
 	pi.registerShortcut("ctrl+t", {
@@ -589,8 +754,9 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /bg run <bash command>", "error");
 					return;
 				}
-				const bg = spawnShellBackground(ctx, payload);
-				ctx.ui.notify(`Started shell #${bg.id}`, "info");
+				const bg = await spawnShellBackground(ctx, payload);
+				if (!bg) return;
+				ctx.ui.notify(`Started shell #${bg.id}${bg.gobJobId ? ` (gob:${bg.gobJobId})` : ""}`, "info");
 				return;
 			}
 
@@ -599,8 +765,9 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /bg agent <prompt>", "error");
 					return;
 				}
-				const bg = spawnAgentBackground(ctx, payload);
-				ctx.ui.notify(`Started agent #${bg.id}`, "info");
+				const bg = await spawnAgentBackground(ctx, payload);
+				if (!bg) return;
+				ctx.ui.notify(`Started agent #${bg.id}${bg.gobJobId ? ` (gob:${bg.gobJobId})` : ""}`, "info");
 				return;
 			}
 
@@ -615,12 +782,24 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Background task #${id} not found.`, "error");
 					return;
 				}
-				if (bg.proc && bg.status === "running") {
-					bg.proc.kill("SIGTERM");
-					completeBackgroundTask(ctx, bg, "killed", null);
+				if (bg.status !== "running") {
+					ctx.ui.notify(`Background task #${id} is not running.`, "warning");
 					return;
 				}
-				ctx.ui.notify(`Background task #${id} is not running.`, "warning");
+				if (!bg.gobJobId) {
+					ctx.ui.notify(`Background task #${id} has no gob job id.`, "error");
+					return;
+				}
+				const stopResult = await execCommand("gob", ["stop", bg.gobJobId], process.cwd());
+				if (stopResult.exitCode !== 0) {
+					appendTail(bg, stopResult.stderr || stopResult.stdout || `failed to stop gob job ${bg.gobJobId}`);
+					refreshAll(ctx);
+					ctx.ui.notify(`Failed to stop gob:${bg.gobJobId}`, "error");
+					return;
+				}
+				appendTail(bg, stopResult.stdout || `stopped gob job ${bg.gobJobId}`);
+				completeBackgroundTask(ctx, bg, "killed", null);
+				stopGobPollingIfIdle();
 				return;
 			}
 
@@ -638,7 +817,8 @@ export default function (pi: ExtensionAPI) {
 					.sort((a, b) => b.id - a.id)
 					.map((bg) => {
 						const elapsed = formatDuration((bg.endedAt || Date.now()) - bg.startedAt);
-						return `#${bg.id} [${bg.kind}] ${bg.status} ${elapsed} - ${bg.title}`;
+						const gobRef = bg.gobJobId ? ` gob:${bg.gobJobId}` : "";
+						return `#${bg.id} [${bg.kind}] ${bg.status} ${elapsed}${gobRef} - ${bg.title}`;
 					});
 				pi.sendMessage({
 					customType: "backtask-bg-list",
@@ -654,11 +834,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		ctxRef = ctx;
-		// Standalone plugin: no repo-specific theme defaults dependency.
 		const state = readState();
 		nextTaskId = state.nextTaskId;
 		tasks = state.tasks;
 		refreshAll(ctx);
+		void ensureGobInstalled(ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -671,12 +851,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		persist();
-		if (!ctxRef) return;
-		for (const bg of backgroundTasks.values()) {
-			if (bg.proc && bg.status === "running") {
-				bg.proc.kill("SIGTERM");
-			}
+		if (gobPollTimer) {
+			clearInterval(gobPollTimer);
+			gobPollTimer = undefined;
 		}
+		if (!ctxRef) return;
 		ctxRef.ui.setWidget("pi-backtask-bg", undefined);
 	});
 }
