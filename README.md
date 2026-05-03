@@ -5,26 +5,85 @@
 1. Persistent task list management (`/task ...`)
 2. Background jobs for shell commands and Pi agents (`/bg ...`)
 
+All background agent spawning is **human-initiated only** — the LLM never gets a tool to spawn agents autonomously. Results are automatically injected back into the parent conversation when complete.
+
 ## Dependency: gob
 
-This plugin uses [`gob`](https://github.com/juanibiapina/gob) as the background-process backend for `/bg` commands.
+This plugin uses [`gob`](https://github.com/juanibiapina/gob) as the background-process backend for `/bg` commands. gob is a Go CLI process manager designed for AI agents and humans to share a view of background processes. Pre-built binaries are available for Linux and macOS (both amd64 and arm64).
 
-Install on macOS:
+### Install from release binary (Linux/macOS)
+
+```bash
+# Download latest release (adjust platform: linux_amd64, linux_arm64, darwin_amd64, darwin_arm64)
+curl -LO https://github.com/juanibiapina/gob/releases/latest/download/gob_3.4.0_linux_amd64.tar.gz
+tar -xzf gob_3.4.0_linux_amd64.tar.gz
+sudo mv gob /usr/local/bin/   # or ~/.local/bin/
+gob --version
+```
+
+### Install via Homebrew (macOS)
 
 ```bash
 brew tap juanibiapina/taps
 brew install gob
 ```
 
+### Install from source (requires Go 1.25.4+)
+
+```bash
+go install github.com/juanibiapina/gob@latest
+```
+
 If `gob` is missing, `/bg run` and `/bg agent` fail with an install hint.
 
 ## Features
 
-- `Ctrl+T` toggles the task-list footer
-- `Ctrl+B` toggles the background-task widget
-- `/task add|start|done|pending|remove|clear|list`
-- `/bg run|agent|list|kill|clear` (backed by `gob add/list/stop/stdout`)
-- Non-intrusive integration: no `gob tui` launch and no fullscreen takeover
+- **Human-controlled agent spawning** — only slash commands trigger background agents; the LLM cannot spawn them
+- **Automatic result injection** — when a background agent completes, its full result is sent back into the conversation and triggers a new LLM turn
+- **Session file reading** — agent results are read from the pi session file (last assistant message), not just polled stdout
+- **Configurable agent capabilities** — flags for read/write, thinking, model override, full tool access
+- **Persistent task list** — tracks what you're working on across sessions
+- **TUI widgets** — `Ctrl+T` toggles the task-list footer, `Ctrl+B` toggles the background-task widget
+- **Process survival** — background jobs are managed by gob and survive pi crashes/restarts
+- **Non-intrusive** — no `gob tui` launch, no fullscreen takeover
+
+## Installation
+
+### Auto-discovery (recommended)
+
+Symlink or copy into your extensions directory:
+
+```bash
+ln -s /path/to/pi-backtask/pi-backtask.ts ~/.pi/agent/extensions/pi-backtask.ts
+```
+
+### Direct load
+
+```bash
+pi -e /absolute/path/to/pi-backtask.ts
+```
+
+### From git
+
+```bash
+pi install git:github.com/lhl/pi-backtask
+```
+
+## How Result Injection Works
+
+The "boomerang" flow:
+
+1. You type `/bg agent "review the auth module"` — human-initiated
+2. gob spawns a detached `pi` process — survives if your session crashes
+3. The extension polls gob every 2 seconds for status updates
+4. On completion, the extension reads the **full result** (not just a tail):
+   - First tries: the pi session file (`.jsonl`) — parses the last assistant message for the complete response
+   - Falls back to: `gob stdout <jobId>` — full process output
+   - Last resort: the polled output tail (last 50 lines)
+5. The result is injected into the parent conversation via `pi.sendMessage()` with `triggerTurn: true`
+6. The parent LLM wakes up, sees the completed result, and can act on it
+
+Results are capped at 12K characters to avoid context overflow. The notification includes elapsed time and the original task prompt for context.
 
 ## Task list identity
 
@@ -35,14 +94,6 @@ export PI_BACKTASK_LIST_ID=my-project
 ```
 
 When not set, the plugin uses the current working-directory name.
-
-## Usage
-
-Run Pi with the plugin file:
-
-```bash
-pi -e /absolute/path/to/pi-backtask.ts
-```
 
 ## Command reference
 
@@ -74,37 +125,101 @@ pi -e /absolute/path/to/pi-backtask.ts
 
 ### Agent flags
 
+Flags can be combined. Order doesn't matter — everything after flags is the prompt.
+
 | Flag | Effect |
 |------|--------|
-| (none) | Read-only tools, no thinking, no extensions |
-| `--rw` | Adds `edit` and `write` tools |
-| `--think` | Enables thinking (high) |
-| `--model <m>` | Override model (e.g. `anthropic/claude-sonnet-4`) |
-| `--full` | All tools + extensions + thinking |
+| (none) | Read-only tools (`read,bash,grep,find,ls`), no thinking, no extensions |
+| `--rw` | Adds `edit` and `write` tools (agent can modify files) |
+| `--think` | Enables extended thinking (high level) |
+| `--model <m>` | Override model (e.g. `anthropic/claude-sonnet-4`, `openrouter/google/gemini-3-flash-preview`) |
+| `--full` | All tools + extensions + thinking (maximum capability) |
+
+**Model inheritance:** When no `--model` flag is specified, the background agent inherits the current session's model (provider/id). If no model is available, falls back to `openrouter/google/gemini-3-flash-preview`.
+
+**Combining flags:**
+
+```bash
+# Read-write + thinking + specific model
+/bg agent --rw --think --model anthropic/claude-sonnet-4 "Refactor and add tests for the payment module"
+```
+
+### Default agent configuration
+
+Without flags, background agents are spawned with:
+- Tools: `read,bash,grep,find,ls` (read-only — safe for analysis tasks)
+- Thinking: off (faster, cheaper)
+- Extensions: disabled (`--no-extensions`)
+- Mode: `json` (structured output)
+- Session: logged to `~/.pi/agent/sessions/pi-backtask/agent-<id>-<timestamp>.jsonl`
 
 ## End-to-end examples
 
 ### Example A: run tests in background while continuing chat
 
 ```bash
-/task add Validate feature branch before merge
-/task start 1
 /bg run "pytest tests/unit/test_metrics.py -q"
-/bg list
 ```
 
-Continue normal conversation while the tests run. Use `/bg list` to monitor and `/bg kill <id>` to stop if needed.
+Continue normal conversation while the tests run. When tests complete, the result appears in the conversation and the LLM can react to pass/fail.
 
-### Example B: delegate analysis to a background agent
+### Example B: scout/analyze in background
 
 ```bash
-/task add Audit websocket reconnection behavior
-/task start 1
-/bg agent "Audit websocket reconnection path and list concrete failure modes"
+/bg agent "Analyze the auth flow in src/auth/. Map the key files, entry points, and identify potential security concerns."
+```
+
+The agent runs read-only in the background. When done, its analysis is injected into the conversation — the parent LLM can use it to inform next steps.
+
+### Example C: background implementation with review
+
+```bash
+# First: have a background agent implement something
+/bg agent --rw "Implement the caching layer described in docs/DESIGN.md"
+
+# When it completes, the result appears in conversation.
+# Then fire off a reviewer:
+/bg agent "Review the changes just made to the caching implementation. Check for edge cases and missing error handling."
+```
+
+### Example D: parallel research
+
+```bash
+/bg agent "Research how rate limiting is typically implemented in Express.js middleware"
+/bg agent "Look at our current middleware stack in src/middleware/ and document what's there"
 /bg list
 ```
 
-The background agent runs as a detached `pi` process through `gob`, and the plugin tracks status/log tail in the widget.
+Both run concurrently. Results arrive as each completes.
+
+### Example E: use a powerful model for hard problems
+
+```bash
+/bg agent --think --model anthropic/claude-sonnet-4 "This test is flaky. Analyze the race condition in test/integration/worker.test.ts and propose a fix."
+```
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+T` | Toggle task-list footer |
+| `Ctrl+B` | Toggle background-task widget |
+
+## Background widget
+
+When visible (`Ctrl+B`), the widget shows:
+
+```
+┌─────────────────────────────────────────────┐
+│ Background Tasks  running=2                 │
+│  agent #1 running (34s) gob:abc123          │
+│    analyzing auth flow...                   │
+│  shell #2 completed (12s) gob:def456        │
+│    Tests passed: 42/42                      │
+└─────────────────────────────────────────────┘
+```
+
+Each task shows: kind, ID, status, elapsed time, gob job reference, and last output line.
 
 ## Notes on background jobs
 
@@ -115,16 +230,38 @@ The background agent runs as a detached `pi` process through `gob`, and the plug
 - When a background agent completes, its full result is read from the session file (or gob stdout) and injected into the parent conversation with `triggerTurn: true` — the parent LLM sees and processes the result automatically
 - Agent results are capped at 12K characters to avoid context overflow
 - By default, background agents inherit the current session's model
+- Session files are stored at `~/.pi/agent/sessions/pi-backtask/`
+- The gob polling interval is 2 seconds; polling stops automatically when no jobs are running
+- Output tail (shown in widget during execution) buffers the last 50 lines
 
 ## Troubleshooting
 
 - **`gob: command not found`**
   - Install gob (see dependency section), then restart Pi.
 - **Background task started but no output yet**
-  - Use `/bg list` and wait a few seconds; output tail updates are polled from gob.
+  - Use `/bg list` and wait a few seconds; output tail updates are polled from gob every 2s.
+- **Result didn't appear in conversation**
+  - Check if the agent is still running: `/bg list`
+  - Check gob directly: `gob list`, `gob stdout <job_id>`
+  - Session file may have useful details: check `~/.pi/agent/sessions/pi-backtask/`
+- **Agent spawned with wrong model**
+  - Use `--model` flag explicitly, or check that your current pi session has a model set
 - **Need to inspect raw job output**
-  - Use gob directly: `gob list`, `gob stdout <job_id>`, `gob logs <job_id>`.
+  - Use gob directly: `gob list`, `gob stdout <job_id>`, `gob logs <job_id>`
+- **Want to see what the agent actually did**
+  - Read the session file: it's a JSONL log of the full conversation including tool calls
+
+## Differences from upstream (artiombell/pi-backtask)
+
+This fork (lhl/pi-backtask) adds:
+
+- **Full result injection** — reads the complete agent response from session file, not just polled tail
+- **Agent flags** — `--rw`, `--think`, `--model`, `--full` for configurable agent capabilities
+- **Larger result cap** — 12K chars (up from 6K)
+- **Larger tail buffer** — 50 lines (up from 20)
+- **Richer notifications** — includes elapsed time and original task in completion messages
+- **Model inheritance** — agents inherit the parent session's model by default
 
 ## File
 
-- `pi-backtask.ts`: plugin source
+- `pi-backtask.ts`: plugin source (single-file extension)
