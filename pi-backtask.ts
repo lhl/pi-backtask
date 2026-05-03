@@ -153,8 +153,8 @@ function appendTail(bg: BackgroundTask, chunk: string) {
 		.filter(Boolean);
 	if (lines.length === 0) return;
 	bg.outputTail.push(...lines);
-	if (bg.outputTail.length > 20) {
-		bg.outputTail = bg.outputTail.slice(-20);
+	if (bg.outputTail.length > 50) {
+		bg.outputTail = bg.outputTail.slice(-50);
 	}
 }
 
@@ -386,31 +386,76 @@ export default function (pi: ExtensionAPI) {
 		refreshBackgroundWidget(ctx);
 	}
 
-	function completeBackgroundTask(ctx: ExtensionContext, bg: BackgroundTask, status: BackgroundStatus, exitCode: number | null = null) {
+	/**
+	 * Read the full output from gob stdout on completion (not just the polled tail).
+	 * For agent tasks, also try reading the session file for the final assistant message.
+	 */
+	async function readFullResult(bg: BackgroundTask): Promise<string> {
+		// Try reading the session file for agent tasks (contains full conversation)
+		if (bg.kind === "agent" && bg.sessionFile && fs.existsSync(bg.sessionFile)) {
+			try {
+				const lines = fs.readFileSync(bg.sessionFile, "utf8").trim().split("\n");
+				// Walk backwards to find the last assistant message
+				for (let i = lines.length - 1; i >= 0; i--) {
+					try {
+						const event = JSON.parse(lines[i]);
+						if (event.role === "assistant" && event.content) {
+							const text = Array.isArray(event.content)
+								? event.content
+									.filter((b: any) => b.type === "text")
+									.map((b: any) => b.text)
+									.join("\n")
+								: String(event.content);
+							if (text.trim()) return text;
+						}
+					} catch { /* skip malformed lines */ }
+				}
+			} catch { /* fall through to gob stdout */ }
+		}
+
+		// Fall back to full gob stdout
+		if (bg.gobJobId) {
+			try {
+				const result = await execCommand("gob", ["stdout", bg.gobJobId], process.cwd());
+				if (result.exitCode === 0 && result.stdout.trim()) {
+					return result.stdout.trim();
+				}
+			} catch { /* fall through to tail */ }
+		}
+
+		// Last resort: use the polled tail
+		return bg.outputTail.join("\n");
+	}
+
+	async function completeBackgroundTask(ctx: ExtensionContext, bg: BackgroundTask, status: BackgroundStatus, exitCode: number | null = null) {
 		bg.status = status;
 		bg.endedAt = Date.now();
 		bg.exitCode = exitCode;
 		refreshAll(ctx);
 
+		const elapsed = formatDuration(bg.endedAt - bg.startedAt);
 		const headline =
 			status === "completed"
-				? `${bg.kind} #${bg.id} completed`
+				? `✓ ${bg.kind} #${bg.id} completed (${elapsed})`
 				: status === "killed"
-					? `${bg.kind} #${bg.id} killed`
-					: `${bg.kind} #${bg.id} failed`;
+					? `■ ${bg.kind} #${bg.id} killed (${elapsed})`
+					: `✗ ${bg.kind} #${bg.id} failed (${elapsed})`;
 		ctx.ui.notify(headline, status === "completed" ? "success" : status === "killed" ? "warning" : "error");
 
-		const tail = bg.outputTail.join("\n");
-		if (tail.trim()) {
-			pi.sendMessage(
-				{
-					customType: "backtask-result",
-					content: `[${headline}]\n\n${tail.slice(-6000)}`,
-					display: true,
-				},
-				{ deliverAs: "followUp", triggerTurn: true }
-			);
-		}
+		// Read full result (not just tail) for the LLM
+		const fullResult = await readFullResult(bg);
+		const content = fullResult.trim()
+			? `[${headline}]\nTask: ${bg.title}\n\n${fullResult.slice(-12000)}`
+			: `[${headline}]\nTask: ${bg.title}\n\n(no output)`;
+
+		pi.sendMessage(
+			{
+				customType: "backtask-result",
+				content,
+				display: true,
+			},
+			{ deliverAs: "followUp", triggerTurn: true }
+		);
 	}
 
 	async function ensureGobInstalled(ctx: ExtensionContext): Promise<boolean> {
@@ -500,7 +545,7 @@ export default function (pi: ExtensionAPI) {
 				const job = byId.get(bg.gobJobId!);
 				if (!job) {
 					appendTail(bg, `gob job ${bg.gobJobId} not found`);
-					completeBackgroundTask(ctx, bg, bg.status === "killed" ? "killed" : "failed", bg.exitCode ?? null);
+					await completeBackgroundTask(ctx, bg, bg.status === "killed" ? "killed" : "failed", bg.exitCode ?? null);
 					continue;
 				}
 
@@ -509,7 +554,7 @@ export default function (pi: ExtensionAPI) {
 				if (job.status !== "running") {
 					const exitCode = typeof job.exit_code === "number" ? job.exit_code : null;
 					const status = bg.status === "killed" ? "killed" : exitCode === 0 ? "completed" : "failed";
-					completeBackgroundTask(ctx, bg, status, exitCode);
+					await completeBackgroundTask(ctx, bg, status, exitCode);
 				}
 			}
 
@@ -555,7 +600,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!(await ensureGobInstalled(ctx))) {
 			appendTail(bg, "gob CLI missing; cannot start background task");
-			completeBackgroundTask(ctx, bg, "failed", null);
+			await completeBackgroundTask(ctx, bg, "failed", null);
 			return null;
 		}
 
@@ -571,7 +616,7 @@ export default function (pi: ExtensionAPI) {
 		const addResult = await execCommand("gob", addArgs, process.cwd());
 		if (addResult.exitCode !== 0) {
 			appendTail(bg, addResult.stderr || addResult.stdout || "gob add failed");
-			completeBackgroundTask(ctx, bg, "failed", addResult.exitCode);
+			await completeBackgroundTask(ctx, bg, "failed", addResult.exitCode);
 			return bg;
 		}
 
@@ -589,7 +634,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!jobId) {
 			appendTail(bg, output || "unable to determine gob job id");
-			completeBackgroundTask(ctx, bg, "failed", null);
+			await completeBackgroundTask(ctx, bg, "failed", null);
 			return bg;
 		}
 
@@ -611,32 +656,75 @@ export default function (pi: ExtensionAPI) {
 		return spawnGobBackground(ctx, "shell", command, description, "bash", ["-lc", command]);
 	}
 
-	async function spawnAgentBackground(ctx: ExtensionContext, prompt: string) {
+	/**
+	 * Parse /bg agent options. Supports:
+	 *   /bg agent <prompt>
+	 *   /bg agent --rw <prompt>           (adds write+edit tools)
+	 *   /bg agent --model <model> <prompt>
+	 *   /bg agent --think <prompt>        (enables thinking)
+	 *   /bg agent --full <prompt>         (all tools + extensions + thinking)
+	 */
+	function parseBgAgentArgs(raw: string): { prompt: string; rw: boolean; model?: string; think: boolean; full: boolean } {
+		const tokens = raw.split(/\s+/);
+		let rw = false;
+		let think = false;
+		let full = false;
+		let model: string | undefined;
+		const rest: string[] = [];
+
+		for (let i = 0; i < tokens.length; i++) {
+			const t = tokens[i];
+			if (t === "--rw") { rw = true; continue; }
+			if (t === "--think") { think = true; continue; }
+			if (t === "--full") { full = true; continue; }
+			if (t === "--model" && i + 1 < tokens.length) { model = tokens[++i]; continue; }
+			rest.push(t);
+		}
+		return { prompt: rest.join(" "), rw, model, think, full };
+	}
+
+	async function spawnAgentBackground(ctx: ExtensionContext, rawArgs: string) {
+		const { prompt, rw, model: modelOverride, think, full } = parseBgAgentArgs(rawArgs);
+		if (!prompt.trim()) return null;
+
 		const localId = nextBgId;
 		const sessionFile = makeAgentSessionFile(localId);
-		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "openrouter/google/gemini-3-flash-preview";
+		const model = modelOverride || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "openrouter/google/gemini-3-flash-preview");
 		const description = `pi-backtask agent: ${prompt.slice(0, 120)}`;
+
+		const tools = full
+			? "read,bash,grep,find,ls,edit,write"
+			: rw
+				? "read,bash,grep,find,ls,edit,write"
+				: "read,bash,grep,find,ls";
+
+		const piArgs = [
+			"--mode", "json",
+			"-p",
+			"--session", sessionFile,
+			"--model", model,
+			"--tools", tools,
+		];
+
+		if (!full) {
+			piArgs.push("--no-extensions");
+		}
+
+		if (think || full) {
+			piArgs.push("--thinking", "high");
+		} else {
+			piArgs.push("--thinking", "off");
+		}
+
+		piArgs.push(prompt);
+
 		return spawnGobBackground(
 			ctx,
 			"agent",
 			prompt,
 			description,
 			"pi",
-			[
-				"--mode",
-				"json",
-				"-p",
-				"--session",
-				sessionFile,
-				"--no-extensions",
-				"--model",
-				model,
-				"--tools",
-				"read,bash,grep,find,ls",
-				"--thinking",
-				"off",
-				prompt,
-			],
+			piArgs,
 			sessionFile
 		);
 	}
@@ -762,11 +850,14 @@ export default function (pi: ExtensionAPI) {
 
 			if (action === "agent") {
 				if (!payload) {
-					ctx.ui.notify("Usage: /bg agent <prompt>", "error");
+					ctx.ui.notify("Usage: /bg agent [--rw] [--think] [--full] [--model <m>] <prompt>", "error");
 					return;
 				}
 				const bg = await spawnAgentBackground(ctx, payload);
-				if (!bg) return;
+				if (!bg) {
+					ctx.ui.notify("Failed to start agent (empty prompt?)", "error");
+					return;
+				}
 				ctx.ui.notify(`Started agent #${bg.id}${bg.gobJobId ? ` (gob:${bg.gobJobId})` : ""}`, "info");
 				return;
 			}
@@ -798,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				appendTail(bg, stopResult.stdout || `stopped gob job ${bg.gobJobId}`);
-				completeBackgroundTask(ctx, bg, "killed", null);
+				await completeBackgroundTask(ctx, bg, "killed", null);
 				stopGobPollingIfIdle();
 				return;
 			}

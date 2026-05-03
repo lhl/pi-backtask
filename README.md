@@ -63,10 +63,24 @@ pi -e /absolute/path/to/pi-backtask.ts
 ```bash
 /bg run "pytest tests/unit/test_metrics.py -q"
 /bg agent "Review app/core/pipeline.py and propose a safer retry strategy"
+/bg agent --rw "Refactor the auth module to use middleware pattern"
+/bg agent --think "Analyze this complex race condition in worker.ts"
+/bg agent --model anthropic/claude-sonnet-4 "Review the API design"
+/bg agent --full "Implement the new caching layer with full tool access"
 /bg list
 /bg kill 2
 /bg clear
 ```
+
+### Agent flags
+
+| Flag | Effect |
+|------|--------|
+| (none) | Read-only tools, no thinking, no extensions |
+| `--rw` | Adds `edit` and `write` tools |
+| `--think` | Enables thinking (high) |
+| `--model <m>` | Override model (e.g. `anthropic/claude-sonnet-4`) |
+| `--full` | All tools + extensions + thinking |
 
 ## End-to-end examples
 
@@ -98,6 +112,9 @@ The background agent runs as a detached `pi` process through `gob`, and the plug
 - `/bg agent` starts a detached `pi` process through `gob add`
 - `/bg kill <id>` maps to `gob stop <job_id>`
 - Jobs are managed by gob, so they can outlive the current Pi session
+- When a background agent completes, its full result is read from the session file (or gob stdout) and injected into the parent conversation with `triggerTurn: true` — the parent LLM sees and processes the result automatically
+- Agent results are capped at 12K characters to avoid context overflow
+- By default, background agents inherit the current session's model
 
 ## Troubleshooting
 
