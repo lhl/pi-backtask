@@ -112,18 +112,34 @@ When not set, the plugin uses the current working-directory name.
 ### Background commands
 
 ```bash
+# Shell commands
 /bg run "pytest tests/unit/test_metrics.py -q"
+/bg run --watch "npm run dev"                        # notify on any new output
+/bg run --watch --pattern "FAIL" "pnpm test --watch"  # notify only on matching output
+/bg run --watch --pattern "/error|warn/i" "make build" # regex pattern
+
+# Agent tasks
 /bg agent "Review app/core/pipeline.py and propose a safer retry strategy"
 /bg agent --rw "Refactor the auth module to use middleware pattern"
 /bg agent --think "Analyze this complex race condition in worker.ts"
 /bg agent --model anthropic/claude-sonnet-4 "Review the API design"
 /bg agent --full "Implement the new caching layer with full tool access"
+
+# Management
 /bg list
 /bg kill 2
 /bg clear
 ```
 
-### Agent flags
+### Shell flags (`/bg run`)
+
+| Flag | Effect |
+|------|--------|
+| (none) | Fire-and-forget — notifies only on exit |
+| `--watch` | Reactive output — wakes the LLM when new output is detected |
+| `--pattern <p>` | Only wakes on output matching pattern (implies `--watch`). Supports plain substring (case-insensitive) or `/regex/flags` |
+
+### Agent flags (`/bg agent`)
 
 Flags can be combined. Order doesn't matter — everything after flags is the prompt.
 
@@ -192,7 +208,23 @@ The agent runs read-only in the background. When done, its analysis is injected 
 
 Both run concurrently. Results arrive as each completes.
 
-### Example E: use a powerful model for hard problems
+### Example E: watch tests, react to failures
+
+```bash
+/bg run --watch --pattern "FAIL" "pnpm test --watch"
+```
+
+The test watcher runs in the background. Only when output contains "FAIL" does the LLM get notified — it can then investigate the failure. Passing tests produce no interruption.
+
+### Example F: watch a dev server for errors
+
+```bash
+/bg run --watch --pattern "/error|exception|crash/i" "npm run dev"
+```
+
+The dev server runs in the background. The LLM is woken only when error-like output appears.
+
+### Example G: use a powerful model for hard problems
 
 ```bash
 /bg agent --think --model anthropic/claude-sonnet-4 "This test is flaky. Analyze the race condition in test/integration/worker.test.ts and propose a fix."
@@ -231,8 +263,17 @@ Each task shows: kind, ID, status, elapsed time, gob job reference, and last out
 - Agent results are capped at 12K characters to avoid context overflow
 - By default, background agents inherit the current session's model
 - Session files are stored at `~/.pi/agent/sessions/pi-backtask/`
-- The gob polling interval is 2 seconds; polling stops automatically when no jobs are running
+- The gob polling interval is 2–3 seconds; polling stops automatically when no jobs are running
 - Output tail (shown in widget during execution) buffers the last 50 lines
+
+### Reactive output (`--watch`)
+
+- When `--watch` is used, the extension monitors gob stdout every ~3s for new output
+- If a `--pattern` is specified, only output matching the pattern triggers a notification
+- Pattern matching supports plain substrings (case-insensitive) and `/regex/flags` syntax
+- Output notifications are debounced (2s) to batch rapid output into a single alert
+- Reactive notifications include up to 4K chars of the new output since the last alert
+- Without `--watch`, shell commands only notify on exit (completion/failure)
 
 ## Troubleshooting
 
@@ -256,11 +297,13 @@ Each task shows: kind, ID, status, elapsed time, gob job reference, and last out
 This fork (lhl/pi-backtask) adds:
 
 - **Full result injection** — reads the complete agent response from session file, not just polled tail
+- **Reactive output** — `--watch` and `--pattern` flags for shell commands; wakes the LLM on matching output
 - **Agent flags** — `--rw`, `--think`, `--model`, `--full` for configurable agent capabilities
 - **Larger result cap** — 12K chars (up from 6K)
 - **Larger tail buffer** — 50 lines (up from 20)
 - **Richer notifications** — includes elapsed time and original task in completion messages
 - **Model inheritance** — agents inherit the parent session's model by default
+- **Faster polling** — 3s throttle (down from 5s) for more responsive output tracking
 
 ## File
 

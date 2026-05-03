@@ -60,6 +60,16 @@ interface BackgroundTask {
 	gobJobId?: string;
 	lastTailLine?: string;
 	lastTailReadAt?: number;
+	/** Reactive output: notify parent on new output */
+	reactToOutput?: boolean;
+	/** Only notify when output matches this pattern (substring or /regex/) */
+	notifyPattern?: string;
+	/** Compiled regex from notifyPattern */
+	notifyMatcher?: RegExp | null;
+	/** Track how much output we've already alerted on */
+	lastAlertedLength?: number;
+	/** Debounce timer for output reactions */
+	outputReactTimer?: any;
 }
 
 interface PersistedState {
@@ -502,14 +512,16 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify("Only one task can stay in progress; older active tasks moved to pending.", "warning");
 	}
 
-	async function syncBgTailFromGob(bg: BackgroundTask) {
+	async function syncBgTailFromGob(bg: BackgroundTask, ctx?: ExtensionContext) {
 		if (!bg.gobJobId) return;
-		if (Date.now() - (bg.lastTailReadAt || 0) < 5000) return;
+		if (Date.now() - (bg.lastTailReadAt || 0) < 3000) return;
 		bg.lastTailReadAt = Date.now();
 
 		const result = await execCommand("gob", ["stdout", bg.gobJobId], process.cwd());
 		if (result.exitCode !== 0) return;
-		const lines = result.stdout
+
+		const fullOutput = result.stdout;
+		const lines = fullOutput
 			.split(/\r?\n/)
 			.map((line) => line.trim())
 			.filter(Boolean);
@@ -518,6 +530,38 @@ export default function (pi: ExtensionAPI) {
 		if (bg.lastTailLine === lastLine) return;
 		bg.lastTailLine = lastLine;
 		appendTail(bg, lastLine);
+
+		// Reactive output: check for new output that matches pattern
+		if (bg.reactToOutput && ctx && bg.status === "running") {
+			const prevLength = bg.lastAlertedLength || 0;
+			if (fullOutput.length > prevLength) {
+				const newOutput = fullOutput.slice(prevLength);
+				const shouldNotify = bg.notifyMatcher
+					? bg.notifyMatcher.test(newOutput)
+					: newOutput.trim().length > 0;
+
+				if (shouldNotify) {
+					// Debounce: wait 2s for more output to accumulate
+					if (bg.outputReactTimer) clearTimeout(bg.outputReactTimer);
+					bg.outputReactTimer = setTimeout(() => {
+						bg.outputReactTimer = null;
+						const alertOutput = fullOutput.slice(bg.lastAlertedLength || 0);
+						bg.lastAlertedLength = fullOutput.length;
+						const patternNote = bg.notifyPattern ? ` (matched: ${bg.notifyPattern})` : "";
+						pi.sendMessage(
+							{
+								customType: "backtask-output",
+								content: `[${bg.kind} #${bg.id} new output${patternNote}]\nCommand: ${bg.title}\n\n${alertOutput.slice(-4000)}`,
+								display: true,
+							},
+							{ triggerTurn: true }
+						);
+					}, 2000);
+				}
+				// Update alerted length even if debounced (prevents duplicate alerts)
+				bg.lastAlertedLength = fullOutput.length;
+			}
+		}
 	}
 
 	function stopGobPollingIfIdle() {
@@ -549,7 +593,7 @@ export default function (pi: ExtensionAPI) {
 					continue;
 				}
 
-				await syncBgTailFromGob(bg);
+				await syncBgTailFromGob(bg, ctx);
 
 				if (job.status !== "running") {
 					const exitCode = typeof job.exit_code === "number" ? job.exit_code : null;
@@ -651,9 +695,55 @@ export default function (pi: ExtensionAPI) {
 		return path.join(dir, `agent-${id}-${Date.now()}.jsonl`);
 	}
 
-	async function spawnShellBackground(ctx: ExtensionContext, command: string) {
+	/**
+	 * Parse a notify pattern string into a RegExp or null.
+	 * Supports: plain substring, or /regex/flags format.
+	 */
+	function parseNotifyPattern(pattern: string): RegExp | null {
+		if (!pattern) return null;
+		const regexMatch = pattern.match(/^\/(.+)\/([gimsuy]*)$/);
+		if (regexMatch) {
+			try {
+				return new RegExp(regexMatch[1], regexMatch[2]);
+			} catch {
+				return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+			}
+		}
+		// Plain substring → case-insensitive match
+		return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+	}
+
+	/**
+	 * Parse /bg run options. Supports:
+	 *   /bg run <command>
+	 *   /bg run --watch <command>              (notify on any new output)
+	 *   /bg run --watch --pattern <p> <command> (notify only on matching output)
+	 */
+	function parseBgRunArgs(raw: string): { command: string; watch: boolean; pattern?: string } {
+		const tokens = raw.split(/\s+/);
+		let watch = false;
+		let pattern: string | undefined;
+		const rest: string[] = [];
+
+		for (let i = 0; i < tokens.length; i++) {
+			const t = tokens[i];
+			if (t === "--watch") { watch = true; continue; }
+			if (t === "--pattern" && i + 1 < tokens.length) { pattern = tokens[++i]; watch = true; continue; }
+			rest.push(t);
+		}
+		return { command: rest.join(" "), watch, pattern };
+	}
+
+	async function spawnShellBackground(ctx: ExtensionContext, command: string, watch = false, pattern?: string) {
 		const description = `pi-backtask shell: ${command.slice(0, 120)}`;
-		return spawnGobBackground(ctx, "shell", command, description, "bash", ["-lc", command]);
+		const bg = await spawnGobBackground(ctx, "shell", command, description, "bash", ["-lc", command]);
+		if (bg && watch) {
+			bg.reactToOutput = true;
+			bg.notifyPattern = pattern;
+			bg.notifyMatcher = pattern ? parseNotifyPattern(pattern) : null;
+			bg.lastAlertedLength = 0;
+		}
+		return bg;
 	}
 
 	/**
@@ -839,12 +929,18 @@ export default function (pi: ExtensionAPI) {
 
 			if (action === "run") {
 				if (!payload) {
-					ctx.ui.notify("Usage: /bg run <bash command>", "error");
+					ctx.ui.notify("Usage: /bg run [--watch] [--pattern <p>] <bash command>", "error");
 					return;
 				}
-				const bg = await spawnShellBackground(ctx, payload);
+				const { command, watch, pattern } = parseBgRunArgs(payload);
+				if (!command.trim()) {
+					ctx.ui.notify("Usage: /bg run [--watch] [--pattern <p>] <bash command>", "error");
+					return;
+				}
+				const bg = await spawnShellBackground(ctx, command, watch, pattern);
 				if (!bg) return;
-				ctx.ui.notify(`Started shell #${bg.id}${bg.gobJobId ? ` (gob:${bg.gobJobId})` : ""}`, "info");
+				const watchNote = watch ? ` [watching${pattern ? `: ${pattern}` : ""}]` : "";
+				ctx.ui.notify(`Started shell #${bg.id}${bg.gobJobId ? ` (gob:${bg.gobJobId})` : ""}${watchNote}`, "info");
 				return;
 			}
 
