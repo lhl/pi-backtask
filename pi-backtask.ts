@@ -1213,10 +1213,12 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 						return { content: [{ type: "text", text: `Denied: ${reason} not allowed by policy. Ask the user to run via /bg run.` }], details: {} };
 					}
 					if (policy === "confirm") {
-						// For confirm policy, we return a message asking the LLM to inform the user
-						// The tool still executes but the LLM should present it to the user first
-						// In practice, pi's tool confirmation UX handles this via the UI
-						ctx.ui.notify(`bg_process: confirming: ${command}`, "warning");
+						// Hard gate: tell the LLM it must get user approval first
+						ctx.ui.notify(`bg_process wants to run: ${command.slice(0, 80)}`, "warning");
+						return {
+							content: [{ type: "text", text: `Confirmation required: ask the user to approve running this command in background:\n\n  ${command}${watch ? `\n  (with reactive output${pattern ? `: ${pattern}` : ""})` : ""}\n\nIf approved, the user can run: /bg run ${watch ? "--watch " : ""}${pattern ? `--pattern "${pattern}" ` : ""}"${command}"` }],
+							details: {},
+						};
 					}
 
 					const bg = await spawnShellBackground(ctx, command, watch, pattern);
@@ -1297,6 +1299,20 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 		const isFull = type === "full";
 		const think = options?.thinking || false;
 		const model = options?.model;
+
+		// Enforce policy
+		const policyKey = isFull ? "agentFull" : isRw ? "agentRw" : "agent";
+		const policy = settings.policy[policyKey];
+		if (policy === "deny") {
+			pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
+				success: false,
+				error: `Denied by policy: ${policyKey} is set to deny`,
+			});
+			return;
+		}
+		if (policy === "confirm" && ctxRef) {
+			ctxRef.ui.notify(`pi-tasks spawn (${policyKey}): ${prompt.slice(0, 80)}`, "warning");
+		}
 
 		// Spawn directly rather than going through parseBgAgentArgs
 		// (avoids prompt-as-flags injection if prompt text contains "--rw" etc.)
