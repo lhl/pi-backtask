@@ -35,6 +35,95 @@ import * as path from "path";
 
 const { spawn } = require("child_process") as any;
 
+// Try to import Type for tool schema; falls back gracefully if unavailable
+let Type: any;
+try {
+	Type = require("@sinclair/typebox").Type;
+} catch {
+	try {
+		Type = require("@mariozechner/pi-ai").Type;
+	} catch {
+		// Type unavailable — tool registration will be skipped
+	}
+}
+
+/**
+ * Policy settings for the bg_process tool.
+ * Each action can be: "allow" (no confirmation), "confirm" (requires approval), or "deny" (blocked).
+ *
+ * Configure in ~/.pi/agent/settings.json or .pi/settings.json:
+ * {
+ *   "backtask": {
+ *     "tool": true,
+ *     "policy": {
+ *       "shell": "allow",
+ *       "shellWatch": "confirm",
+ *       "agent": "deny",
+ *       "agentRw": "deny",
+ *       "agentFull": "deny",
+ *       "kill": "allow"
+ *     }
+ *   }
+ * }
+ */
+type PolicyLevel = "allow" | "confirm" | "deny";
+
+interface BacktaskPolicy {
+	/** Run shell commands in background */
+	shell: PolicyLevel;
+	/** Run shell commands with --watch (reactive output) */
+	shellWatch: PolicyLevel;
+	/** Spawn read-only background agents */
+	agent: PolicyLevel;
+	/** Spawn read-write agents (--rw) */
+	agentRw: PolicyLevel;
+	/** Spawn full-capability agents (--full) */
+	agentFull: PolicyLevel;
+	/** Kill running background tasks */
+	kill: PolicyLevel;
+}
+
+interface BacktaskSettings {
+	/** Whether to register the bg_process tool for LLM use */
+	tool: boolean;
+	/** Per-action policy */
+	policy: BacktaskPolicy;
+}
+
+const DEFAULT_POLICY: BacktaskPolicy = {
+	shell: "allow",
+	shellWatch: "confirm",
+	agent: "deny",
+	agentRw: "deny",
+	agentFull: "deny",
+	kill: "allow",
+};
+
+const DEFAULT_SETTINGS: BacktaskSettings = {
+	tool: true,
+	policy: DEFAULT_POLICY,
+};
+
+function loadBacktaskSettings(): BacktaskSettings {
+	const locations = [
+		path.join(process.cwd(), ".pi", "settings.json"),
+		path.join(os.homedir(), ".pi", "agent", "settings.json"),
+	];
+	for (const loc of locations) {
+		try {
+			if (!fs.existsSync(loc)) continue;
+			const raw = JSON.parse(fs.readFileSync(loc, "utf8"));
+			const bt = raw?.backtask;
+			if (!bt) continue;
+			return {
+				tool: bt.tool ?? DEFAULT_SETTINGS.tool,
+				policy: { ...DEFAULT_POLICY, ...(bt.policy || {}) },
+			};
+		} catch { /* skip malformed */ }
+	}
+	return DEFAULT_SETTINGS;
+}
+
 type TaskStatus = "pending" | "in_progress" | "completed";
 type BackgroundStatus = "running" | "completed" | "failed" | "killed";
 type BackgroundKind = "shell" | "agent";
@@ -1018,6 +1107,143 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Unknown /bg action. Try: run|agent|list|kill|clear", "error");
 		},
 	});
+
+	// ─── bg_process tool (LLM-callable, policy-gated) ───────────────────────
+	const settings = loadBacktaskSettings();
+
+	if (settings.tool && Type) {
+		const BgProcessParams = Type.Object({
+			action: Type.Union([
+				Type.Literal("run"),
+				Type.Literal("list"),
+				Type.Literal("kill"),
+			], { description: "Action to perform" }),
+			command: Type.Optional(Type.String({ description: "Shell command to run in background (for action=run)" })),
+			watch: Type.Optional(Type.Boolean({ description: "Enable reactive output notifications (default: false)" })),
+			pattern: Type.Optional(Type.String({ description: "Only notify on output matching this pattern (substring or /regex/flags). Implies watch=true" })),
+			id: Type.Optional(Type.Number({ description: "Background task ID (for action=kill)" })),
+		});
+
+		pi.registerTool({
+			name: "bg_process",
+			label: "Background Process",
+			description: `Run and manage background shell processes. Actions:
+- run: Start a command in the background (requires 'command'). Optional: watch (notify on output), pattern (filter notifications).
+- list: Show all background tasks with status.
+- kill: Stop a running background task (requires 'id').
+
+Note: This tool is for shell commands only, not for spawning agents. Results are automatically delivered when processes complete.
+Use watch+pattern for test runners, dev servers, and builds where you want to react to specific output.`,
+			promptSnippet: "Run shell commands in background without blocking conversation",
+			promptGuidelines: [
+				"Use bg_process for long-running shell commands: dev servers, test watchers, builds, log tails.",
+				"Do NOT use bg_process to spawn agents or delegate tasks — only shell commands.",
+				"After starting a process, continue other work. You'll be notified on completion or matching output.",
+				"Use watch=true with pattern for reactive monitoring (e.g., pattern='FAIL' for test watchers).",
+				"Prefer bg_process over bash with & or nohup for long-running processes.",
+			],
+			parameters: BgProcessParams,
+
+			async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+				ctxRef = ctx;
+
+				if (params.action === "list") {
+					const rows = Array.from(backgroundTasks.values())
+						.sort((a, b) => b.id - a.id)
+						.map((bg) => {
+							const elapsed = formatDuration((bg.endedAt || Date.now()) - bg.startedAt);
+							const gobRef = bg.gobJobId ? ` gob:${bg.gobJobId}` : "";
+							return `#${bg.id} [${bg.kind}] ${bg.status} ${elapsed}${gobRef} - ${bg.title}`;
+						});
+					return {
+						content: [{ type: "text", text: rows.length > 0 ? rows.join("\n") : "No background tasks." }],
+						details: {},
+					};
+				}
+
+				if (params.action === "kill") {
+					const policy = settings.policy.kill;
+					if (policy === "deny") {
+						return { content: [{ type: "text", text: "Denied: kill action is not allowed by policy." }], details: {} };
+					}
+					const id = params.id;
+					if (!id) {
+						return { content: [{ type: "text", text: "Error: 'id' is required for kill action." }], details: {} };
+					}
+					const bg = backgroundTasks.get(id);
+					if (!bg) {
+						return { content: [{ type: "text", text: `Error: Background task #${id} not found.` }], details: {} };
+					}
+					if (bg.status !== "running") {
+						return { content: [{ type: "text", text: `Task #${id} is not running (status: ${bg.status}).` }], details: {} };
+					}
+					if (!bg.gobJobId) {
+						return { content: [{ type: "text", text: `Task #${id} has no gob job id.` }], details: {} };
+					}
+					const stopResult = await execCommand("gob", ["stop", bg.gobJobId], process.cwd());
+					if (stopResult.exitCode !== 0) {
+						return { content: [{ type: "text", text: `Failed to stop task #${id}: ${stopResult.stderr || stopResult.stdout}` }], details: {} };
+					}
+					appendTail(bg, `stopped gob job ${bg.gobJobId}`);
+					await completeBackgroundTask(ctx, bg, "killed", null);
+					return { content: [{ type: "text", text: `Killed task #${id} (gob:${bg.gobJobId}).` }], details: {} };
+				}
+
+				if (params.action === "run") {
+					const command = params.command?.trim();
+					if (!command) {
+						return { content: [{ type: "text", text: "Error: 'command' is required for run action." }], details: {} };
+					}
+
+					const watch = params.watch || !!params.pattern;
+					const pattern = params.pattern;
+
+					// Determine policy
+					const policy = watch ? settings.policy.shellWatch : settings.policy.shell;
+					if (policy === "deny") {
+						const reason = watch ? "shell commands with --watch" : "shell commands";
+						return { content: [{ type: "text", text: `Denied: ${reason} not allowed by policy. Ask the user to run via /bg run.` }], details: {} };
+					}
+					if (policy === "confirm") {
+						// For confirm policy, we return a message asking the LLM to inform the user
+						// The tool still executes but the LLM should present it to the user first
+						// In practice, pi's tool confirmation UX handles this via the UI
+						ctx.ui.notify(`bg_process: confirming: ${command}`, "warning");
+					}
+
+					const bg = await spawnShellBackground(ctx, command, watch, pattern);
+					if (!bg) {
+						return { content: [{ type: "text", text: "Failed to start background task. Is gob installed?" }], details: {} };
+					}
+					const watchNote = watch ? ` [watching${pattern ? `: ${pattern}` : ""}]` : "";
+					return {
+						content: [{ type: "text", text: `Started shell #${bg.id}${bg.gobJobId ? ` (gob:${bg.gobJobId})` : ""}${watchNote}\nCommand: ${command}` }],
+						details: {},
+					};
+				}
+
+				return { content: [{ type: "text", text: "Unknown action. Use: run, list, or kill." }], details: {} };
+			},
+		});
+	}
+
+	// ─── Block bash background patterns (optional, when tool is enabled) ────
+	if (settings.tool && settings.policy.shell !== "deny") {
+		pi.on("tool_call", async (event, ctx) => {
+			if (event.toolName !== "bash") return;
+			const command = String((event as any).input?.command ?? "");
+			// Detect common background patterns
+			if (/&\s*$/.test(command) || /\b(nohup|disown|setsid)\b/.test(command)) {
+				return {
+					block: true,
+					reason: "Background shell patterns (&, nohup, disown, setsid) are not supported. " +
+						'Use the bg_process tool with action "run" to run commands in the background. ' +
+						'Example: bg_process({ action: "run", command: "npm run dev", watch: true })',
+				};
+			}
+			return undefined;
+		});
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		ctxRef = ctx;

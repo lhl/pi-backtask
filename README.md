@@ -292,10 +292,104 @@ Each task shows: kind, ID, status, elapsed time, gob job reference, and last out
 - **Want to see what the agent actually did**
   - Read the session file: it's a JSONL log of the full conversation including tool calls
 
+## LLM-Callable Tool: `bg_process`
+
+In addition to human-only slash commands, the extension can register a `bg_process` tool that the LLM can call directly — **for shell commands only, not agent spawning**.
+
+This is controlled by settings. By default, the tool is enabled with sensible policies:
+
+### Policy Configuration
+
+Add to `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project):
+
+```json
+{
+  "backtask": {
+    "tool": true,
+    "policy": {
+      "shell": "allow",
+      "shellWatch": "confirm",
+      "agent": "deny",
+      "agentRw": "deny",
+      "agentFull": "deny",
+      "kill": "allow"
+    }
+  }
+}
+```
+
+### Policy Levels
+
+| Level | Behavior |
+|-------|----------|
+| `"allow"` | LLM can use freely, no confirmation |
+| `"confirm"` | Executes but shows a warning notification (future: full confirmation gate) |
+| `"deny"` | Blocked — tool returns an error telling the LLM to ask the user |
+
+### Policy Actions
+
+| Action | What it controls | Default |
+|--------|------------------|---------|
+| `shell` | Run shell commands in background | `"allow"` |
+| `shellWatch` | Run shell commands with reactive output (`watch: true`) | `"confirm"` |
+| `agent` | Spawn read-only background agents | `"deny"` |
+| `agentRw` | Spawn read-write agents | `"deny"` |
+| `agentFull` | Spawn full-capability agents | `"deny"` |
+| `kill` | Kill running background tasks | `"allow"` |
+
+### Tool Schema
+
+The LLM sees this tool:
+
+```typescript
+bg_process({
+  action: "run" | "list" | "kill",
+  command?: string,     // for action="run"
+  watch?: boolean,      // enable reactive output notifications
+  pattern?: string,     // filter notifications (substring or /regex/)
+  id?: number,          // for action="kill"
+})
+```
+
+### Examples (LLM perspective)
+
+```
+// Start a dev server
+bg_process({ action: "run", command: "npm run dev" })
+
+// Watch tests for failures
+bg_process({ action: "run", command: "pnpm test --watch", watch: true, pattern: "FAIL" })
+
+// Check what's running
+bg_process({ action: "list" })
+
+// Kill a stuck process
+bg_process({ action: "kill", id: 3 })
+```
+
+### Background Command Interception
+
+When the tool is enabled, the extension also blocks common bash background patterns (`&`, `nohup`, `disown`, `setsid`) and redirects the LLM to use `bg_process` instead. This prevents the LLM from using shell tricks that would lose process tracking.
+
+### Disabling the Tool Entirely
+
+Set `"tool": false` to keep pi-backtask human-only (slash commands work, no LLM tool):
+
+```json
+{
+  "backtask": {
+    "tool": false
+  }
+}
+```
+
 ## Differences from upstream (artiombell/pi-backtask)
 
 This fork (lhl/pi-backtask) adds:
 
+- **LLM-callable `bg_process` tool** — policy-gated tool for shell commands (agent spawning stays human-only)
+- **Fine-grained policy system** — per-action allow/confirm/deny controls in settings
+- **Background command interception** — blocks `&`/`nohup`/`disown` in bash, redirects to `bg_process`
 - **Full result injection** — reads the complete agent response from session file, not just polled tail
 - **Reactive output** — `--watch` and `--pattern` flags for shell commands; wakes the LLM on matching output
 - **Agent flags** — `--rw`, `--think`, `--model`, `--full` for configurable agent capabilities
