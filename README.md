@@ -324,7 +324,7 @@ Add to `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project):
 | Level | Behavior |
 |-------|----------|
 | `"allow"` | LLM can use freely, no confirmation |
-| `"confirm"` | Executes but shows a warning notification (future: full confirmation gate) |
+| `"confirm"` | Hard gate — tool returns a message telling the LLM to ask the user for approval, and provides the equivalent `/bg` command. Does not execute. |
 | `"deny"` | Blocked — tool returns an error telling the LLM to ask the user |
 
 ### Policy Actions
@@ -415,6 +415,10 @@ pi install npm:@tintinweb/pi-tasks
 ```
 
 Do **not** install `@tintinweb/pi-subagents` — pi-backtask replaces it with gob-backed agents that survive pi crashes.
+
+### Policy enforcement on pi-tasks RPC
+
+The same policy system gates RPC spawns from pi-tasks. Since pi-tasks typically sends generic agent types (e.g., `"general-purpose"`, `"Explore"`), these hit the `agent` policy. With the default `"deny"`, pi-tasks' `TaskExecute` will receive an error — you must explicitly set `"agent": "allow"` (or `"confirm"`) to enable it.
 
 ### Benefits over @tintinweb/pi-subagents
 
