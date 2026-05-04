@@ -547,14 +547,22 @@ export default function (pi: ExtensionAPI) {
 			? `[${headline}]\nTask: ${bg.title}\n\n${fullResult.slice(-12000)}`
 			: `[${headline}]\nTask: ${bg.title}\n\n(no output)`;
 
-		pi.sendMessage(
-			{
-				customType: "backtask-result",
-				content,
-				display: true,
-			},
-			{ deliverAs: "followUp", triggerTurn: true }
-		);
+		// Check if this task was spawned via the subagents RPC protocol
+		const subagentId = findSubagentId(bg.id);
+		if (subagentId) {
+			// Emit lifecycle events for pi-tasks; it handles its own result routing
+			emitSubagentLifecycleEvent(bg, subagentId, fullResult);
+		} else {
+			// Normal pi-backtask flow: inject result into parent conversation
+			pi.sendMessage(
+				{
+					customType: "backtask-result",
+					content,
+					display: true,
+				},
+				{ deliverAs: "followUp", triggerTurn: true }
+			);
+		}
 	}
 
 	async function ensureGobInstalled(ctx: ExtensionContext): Promise<boolean> {
@@ -1245,6 +1253,173 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 		});
 	}
 
+	// ─── @tintinweb/pi-subagents RPC compatibility layer ────────────────────
+	// Implements the pi-subagents event protocol so @tintinweb/pi-tasks'
+	// TaskExecute can spawn agents via pi-backtask's gob backend.
+	const SUBAGENTS_PROTOCOL_VERSION = 2;
+
+	/** Maps subagent IDs to background task IDs for completion routing. */
+	const subagentBgMap = new Map<string, number>();
+
+	// Handle ping requests from pi-tasks
+	pi.events.on("subagents:rpc:ping", (data: any) => {
+		const requestId = data?.requestId;
+		if (!requestId) return;
+		pi.events.emit(`subagents:rpc:ping:reply:${requestId}`, {
+			success: true,
+			data: { version: SUBAGENTS_PROTOCOL_VERSION },
+		});
+	});
+
+	// Handle spawn requests from pi-tasks
+	pi.events.on("subagents:rpc:spawn", async (data: any) => {
+		const { requestId, type, prompt, options } = data || {};
+		if (!requestId) return;
+
+		if (!prompt?.trim()) {
+			pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
+				success: false,
+				error: "Empty prompt",
+			});
+			return;
+		}
+
+		if (!ctxRef) {
+			pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
+				success: false,
+				error: "No active session context",
+			});
+			return;
+		}
+
+		// Map pi-tasks agent types to capability flags
+		const isRw = type === "code" || type === "edit" || options?.tools?.includes("edit");
+		const isFull = type === "full";
+		const think = options?.thinking || false;
+		const model = options?.model;
+
+		// Spawn directly rather than going through parseBgAgentArgs
+		// (avoids prompt-as-flags injection if prompt text contains "--rw" etc.)
+		const localId = nextBgId;
+		const sessionFile = makeAgentSessionFile(localId);
+		const resolvedModel = model || (ctxRef.model ? `${ctxRef.model.provider}/${ctxRef.model.id}` : "openrouter/google/gemini-3-flash-preview");
+		const description = `pi-backtask agent (via pi-tasks): ${prompt.slice(0, 120)}`;
+
+		const tools = isFull || isRw
+			? "read,bash,grep,find,ls,edit,write"
+			: "read,bash,grep,find,ls";
+
+		const piArgs = [
+			"--mode", "json",
+			"-p",
+			"--session", sessionFile,
+			"--model", resolvedModel,
+			"--tools", tools,
+		];
+
+		if (!isFull) {
+			piArgs.push("--no-extensions");
+		}
+
+		if (think || isFull) {
+			piArgs.push("--thinking", "high");
+		} else {
+			piArgs.push("--thinking", "off");
+		}
+
+		piArgs.push(prompt);
+
+		const bg = await spawnGobBackground(
+			ctxRef,
+			"agent",
+			prompt,
+			description,
+			"pi",
+			piArgs,
+			sessionFile
+		);
+
+		if (!bg) {
+			pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
+				success: false,
+				error: "Failed to spawn background agent",
+			});
+			return;
+		}
+
+		// Use a stable agent ID that pi-tasks can track
+		const agentId = `backtask-agent-${bg.id}`;
+		subagentBgMap.set(agentId, bg.id);
+
+		pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
+			success: true,
+			data: { id: agentId },
+		});
+	});
+
+	// Handle stop requests from pi-tasks
+	pi.events.on("subagents:rpc:stop", async (data: any) => {
+		const { requestId, agentId } = data || {};
+		if (!requestId) return;
+
+		const bgId = subagentBgMap.get(agentId);
+		const bg = bgId != null ? backgroundTasks.get(bgId) : undefined;
+
+		if (!bg || bg.status !== "running" || !bg.gobJobId) {
+			pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, {
+				success: false,
+				error: `Agent ${agentId} not found or not running`,
+			});
+			return;
+		}
+
+		const stopResult = await execCommand("gob", ["stop", bg.gobJobId], process.cwd());
+		if (stopResult.exitCode !== 0) {
+			pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, {
+				success: false,
+				error: stopResult.stderr || "Failed to stop gob job",
+			});
+			return;
+		}
+
+		pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, {
+			success: true,
+			data: {},
+		});
+	});
+
+	/**
+	 * Emit subagent lifecycle events so pi-tasks can track task completion
+	 * and cascade dependencies.
+	 */
+	function findSubagentId(bgId: number): string | undefined {
+		for (const [agentId, mappedBgId] of subagentBgMap.entries()) {
+			if (mappedBgId === bgId) return agentId;
+		}
+		return undefined;
+	}
+
+	function emitSubagentLifecycleEvent(bg: BackgroundTask, agentId: string, fullResult: string) {
+		if (bg.status === "completed") {
+			pi.events.emit("subagents:completed", { id: agentId, result: fullResult.slice(-12000) });
+		} else if (bg.status === "killed") {
+			pi.events.emit("subagents:failed", {
+				id: agentId,
+				error: "Agent stopped",
+				result: fullResult.slice(-12000),
+				status: "stopped",
+			});
+		} else if (bg.status === "failed") {
+			const error = bg.outputTail[bg.outputTail.length - 1] || "Agent failed";
+			pi.events.emit("subagents:failed", { id: agentId, error });
+		}
+
+		subagentBgMap.delete(agentId);
+	}
+
+	// Announce readiness so pi-tasks can discover us
+	pi.events.emit("subagents:ready");
+
 	pi.on("session_start", async (_event, ctx) => {
 		ctxRef = ctx;
 		const state = readState();
@@ -1252,6 +1427,8 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 		tasks = state.tasks;
 		refreshAll(ctx);
 		void ensureGobInstalled(ctx);
+		// Re-announce after session starts in case pi-tasks loaded first
+		pi.events.emit("subagents:ready");
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {

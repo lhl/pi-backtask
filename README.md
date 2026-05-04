@@ -5,7 +5,7 @@
 1. Persistent task list management (`/task ...`)
 2. Background jobs for shell commands and Pi agents (`/bg ...`)
 
-All background agent spawning is **human-initiated only** — the LLM never gets a tool to spawn agents autonomously. Results are automatically injected back into the parent conversation when complete.
+All background agent spawning is **human-initiated only** via slash commands — the LLM never gets a direct tool to spawn agents autonomously. However, when paired with `@tintinweb/pi-tasks`, the LLM can use `TaskExecute` to spawn agents through the structured task system (with dependency tracking and cascading). Results are automatically injected back into the parent conversation when complete.
 
 ## Dependency: gob
 
@@ -43,6 +43,7 @@ If `gob` is missing, `/bg run` and `/bg agent` fail with an install hint.
 - **Session file reading** — agent results are read from the pi session file (last assistant message), not just polled stdout
 - **Configurable agent capabilities** — flags for read/write, thinking, model override, full tool access
 - **Persistent task list** — tracks what you're working on across sessions
+- **@tintinweb/pi-tasks integration** — acts as the subagent backend for pi-tasks' TaskExecute (replaces @tintinweb/pi-subagents)
 - **TUI widgets** — `Ctrl+T` toggles the task-list footer, `Ctrl+B` toggles the background-task widget
 - **Process survival** — background jobs are managed by gob and survive pi crashes/restarts
 - **Non-intrusive** — no `gob tui` launch, no fullscreen takeover
@@ -383,10 +384,51 @@ Set `"tool": false` to keep pi-backtask human-only (slash commands work, no LLM 
 }
 ```
 
+## @tintinweb/pi-tasks Compatibility
+
+pi-backtask implements the `@tintinweb/pi-subagents` RPC event protocol, making it a drop-in gob-backed agent backend for [`@tintinweb/pi-tasks`](https://github.com/tintinweb/pi-tasks). This means pi-tasks' `TaskExecute` tool can spawn background agents through pi-backtask's gob infrastructure — no need to install `@tintinweb/pi-subagents` separately.
+
+### How it works
+
+1. **Discovery**: pi-backtask emits `subagents:ready` on load and responds to `subagents:rpc:ping` with protocol version 2
+2. **Spawn**: When pi-tasks calls `TaskExecute`, the RPC request flows through `subagents:rpc:spawn` → pi-backtask spawns a gob-managed `pi` process
+3. **Completion**: When the gob job finishes, pi-backtask emits `subagents:completed` (or `subagents:failed`) → pi-tasks updates task status and cascades dependencies
+4. **Stop**: pi-tasks' `TaskStop` sends `subagents:rpc:stop` → pi-backtask calls `gob stop`
+
+### Agent type mapping
+
+pi-tasks' `agentType` field maps to pi-backtask capabilities:
+
+| agentType | Tools | Thinking | Extensions |
+|-----------|-------|----------|------------|
+| `"code"` or `"edit"` | read, bash, grep, find, ls, edit, write | off | disabled |
+| `"full"` | all (read, bash, grep, find, ls, edit, write) | high | enabled |
+| any other | read, bash, grep, find, ls (read-only) | off | disabled |
+
+### Setup
+
+Install both extensions — no additional configuration needed:
+
+```bash
+pi install npm:@tintinweb/pi-tasks
+# pi-backtask installed via git or symlink (see Installation section)
+```
+
+Do **not** install `@tintinweb/pi-subagents` — pi-backtask replaces it with gob-backed agents that survive pi crashes.
+
+### Benefits over @tintinweb/pi-subagents
+
+- **Process isolation** — agents run as separate OS processes via gob, not in-process
+- **Crash survival** — gob-managed processes outlive the parent pi session
+- **Session logging** — each agent's full conversation is logged to a JSONL session file
+- **Unified management** — agents spawned by TaskExecute show up in `/bg list` and the background widget (`Ctrl+B`)
+- **Full result capture** — completion events include the agent's full response (read from session file), not just a summary
+
 ## Differences from upstream (artiombell/pi-backtask)
 
 This fork (lhl/pi-backtask) adds:
 
+- **@tintinweb/pi-tasks compatibility** — implements the `pi-subagents` RPC protocol so TaskExecute spawns gob-backed agents
 - **LLM-callable `bg_process` tool** — policy-gated tool for shell commands (agent spawning stays human-only)
 - **Fine-grained policy system** — per-action allow/confirm/deny controls in settings
 - **Background command interception** — blocks `&`/`nohup`/`disown` in bash, redirects to `bg_process`
