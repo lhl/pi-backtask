@@ -2,8 +2,9 @@
 
 **Repo:** https://github.com/lhl/pi-backtask  
 **Fork of:** [artiombell/pi-backtask](https://github.com/artiombell/pi-backtask)  
-**Single-file extension:** `pi-backtask.ts` (~1.7K lines)
-**Commit history:** local branch over upstream
+**Single-file extension:** `pi-backtask.ts` (1676 lines)
+
+**Commit history:** 9 commits over upstream; latest bugfix commit `0e3fcea`
 
 ---
 
@@ -11,7 +12,7 @@
 
 A pi-coding-agent extension that provides:
 
-1. **Human-controlled background agent delegation** — `/bg agent` spawns full pi agent sessions via gob (an external process manager). The LLM cannot autonomously spawn agents.
+1. **Human-controlled background agent delegation** — `/bg agent` spawns full pi agent sessions via gob (an external process manager). There is no direct LLM-callable agent-spawn tool; pi-tasks RPC spawns are policy-gated and default-denied.
 2. **LLM-callable background shell processes** — `bg_process` tool lets the LLM start dev servers, test watchers, builds, etc. in the background with reactive output monitoring.
 3. **@tintinweb/pi-tasks compatibility** — Implements the `@tintinweb/pi-subagents` RPC protocol v2, so pi-tasks' `TaskExecute` can route task execution through our gob backend.
 4. **Persistent task list** — `/task add|start|done` for tracking work.
@@ -92,7 +93,7 @@ A pi-coding-agent extension that provides:
 | **LLM** | ✅ `bg_process` tool (policy-gated) | ❌ No tool (denied by default) |
 | **pi-tasks** | N/A | ✅ RPC spawn (policy-gated, default: deny) |
 
-The LLM can manage shell processes (dev servers, test watchers) freely, but cannot spawn autonomous agents unless explicitly permitted in settings.
+Through pi-backtask APIs, the LLM can manage shell processes (dev servers, test watchers) under policy, but cannot spawn autonomous agents unless explicitly permitted in settings. This is not a sandbox for arbitrary `bash`; see caveats below.
 
 ### 2. Policy system
 
@@ -116,7 +117,7 @@ The LLM can manage shell processes (dev servers, test watchers) freely, but cann
 - **`confirm`** — hard gate: returns a message telling the LLM to ask the user, provides the `/bg` command they'd need to run
 - **`deny`** — blocked, error returned
 
-Settings read from `.pi/settings.json` (project) then `~/.pi/agent/settings.json` (global). Project overrides global.
+Settings load global first (`~/.pi/agent/settings.json`), then project (`.pi/settings.json`) overrides only the keys it defines. Explicit invalid policy values fail closed as `deny`; an explicit invalid `tool` value fails closed as disabled.
 
 ### 3. External process management (gob)
 
@@ -134,11 +135,11 @@ When an agent completes, we don't just use the polled output tail. We read the *
 2. `gob stdout` — full process output
 3. Polled tail (last 50 lines) — fallback
 
-Results are capped at 12K chars and injected with `triggerTurn: true` so the parent LLM processes them.
+Results are capped at 12K chars. Normal `/bg` completions are injected with `triggerTurn: true`; RPC-spawned agents emit pi-tasks lifecycle events instead, so pi-tasks owns result routing.
 
 ### 5. Prompt injection prevention in RPC handler
 
-The RPC spawn handler builds pi CLI args directly rather than going through `parseBgAgentArgs` (which splits on whitespace). This prevents a malicious prompt like `"--full do bad things"` from being interpreted as flags.
+The RPC spawn handler builds pi CLI args directly rather than going through `parseBgAgentArgs` (which interprets slash-command flags). This prevents a malicious prompt like `"--full do bad things"` from being interpreted as flags.
 
 ### 6. Background command interception
 
@@ -156,26 +157,42 @@ pi-backtask is a coordination tool, not a sandbox.
 - Gob jobs survive parent Pi crashes, but pi-backtask currently does not reattach old gob jobs into its in-memory task map after restart. Inspect old jobs with `gob list`/`gob stdout`.
 - Completion and reactive-output boomerangs inject untrusted child process/agent output into the parent conversation. Treat it as evidence, not instructions.
 - Agents share the current working tree unless the user launches Pi from a separate worktree/container.
+- Polling currently reads accumulated gob stdout; very noisy long-running jobs can make polling/result capture expensive.
+
+---
+
+## Latest Bugfix Pass (`0e3fcea`)
+
+This handoff includes the post-review bugfix commit. Key fixes:
+
+- Policy settings now merge global → project overrides and fail closed on invalid explicit policy/tool values.
+- RPC `confirm` now hard-gates pi-tasks spawns instead of notifying and continuing.
+- RPC stop now marks the tracked background task as killed and emits the `status: "stopped"` lifecycle path for pi-tasks.
+- Agent session-result parsing now handles Pi v3 JSONL `message` envelopes as well as the older top-level role/content shape.
+- Reactive output debounce now batches actual pending output, checks new output before last-line de-dupe, resets regex state, and clears timers on completion/shutdown.
+- `/bg run` and `/bg agent` slash parsing now handles quoted leading arguments used in the README examples.
+- RPC spawn startup failures no longer return success IDs, and fast RPC jobs register their subagent mapping before polling can complete them.
+- Bash background-pattern interception remains active when shell policy is denied.
 
 ---
 
 ## pi-tasks Protocol Compatibility
 
-Verified against `@tintinweb/pi-tasks` source and test suite:
+Implemented against `@tintinweb/pi-tasks` source/protocol expectations:
 
 | Protocol Event | pi-tasks sends/expects | pi-backtask provides | ✓ |
 |---|---|---|---|
 | `subagents:rpc:ping` | Expects `{ success: true, data: { version: 2 } }` | Returns exactly this | ✓ |
 | `subagents:rpc:spawn` | Sends `{ requestId, type, prompt, options: { description, isBackground, maxTurns?, model? } }` | Handles all fields, maps type to capabilities | ✓ |
 | `subagents:rpc:spawn` reply | Expects `{ success: true, data: { id: string } }` | Returns `backtask-agent-<N>` ID | ✓ |
-| `subagents:rpc:stop` | Sends `{ requestId, agentId }` | Routes to `gob stop`, replies success/failure | ✓ |
+| `subagents:rpc:stop` | Sends `{ requestId, agentId }` | Routes to `gob stop`, marks task killed, emits stopped lifecycle, replies success/failure | ✓ |
 | `subagents:completed` | Listens for `{ id, result }` | Emitted on successful completion | ✓ |
 | `subagents:failed` | Listens for `{ id, error, result, status }` | Emitted on failure/kill | ✓ |
 | `status: "stopped"` | pi-tasks marks task completed (intentional) | Mapped from our "killed" state | ✓ |
 | `subagents:ready` | pi-tasks calls `checkSubagentsVersion()` | Emitted at load + session_start | ✓ |
 | Load order independence | pi-tasks handles either loading first | Dual-emit handles both orderings | ✓ |
 
-**To enable:** Set `"agent": "allow"` in policy settings. Without this, pi-tasks' `TaskExecute` will receive `"Denied by policy"` errors (safe default).
+**To enable:** Set `"agent": "allow"` in policy settings. Without this, pi-tasks' `TaskExecute` will receive `"Denied by policy"` errors (safe default). `"confirm"` is a hard gate/rejection path, not an interactive approval flow.
 
 ---
 
@@ -188,7 +205,7 @@ Verified against `@tintinweb/pi-tasks` source and test suite:
 - `--pattern` flag: filter notifications by substring or `/regex/flags`
 - Debounced notifications (2s) to batch rapid output
 - Completion always notifies parent LLM
-- Background command interception (blocks `&`/`nohup` in bash)
+- Background command interception (best-effort block for `&`/`nohup`/`disown`/`setsid` in bash)
 
 ### Agent Delegation (`/bg agent` — human only)
 
@@ -203,7 +220,7 @@ Verified against `@tintinweb/pi-tasks` source and test suite:
 
 ### Result Injection (the "boomerang")
 
-- On completion: reads full result from session file (last assistant message)
+- On completion: reads full result from session file (last assistant message, including Pi v3 JSONL message envelopes)
 - Injects into conversation via `pi.sendMessage({ triggerTurn: true })`
 - Parent LLM wakes up and processes the result
 - 12K char cap to prevent context overflow
@@ -232,7 +249,7 @@ Verified against `@tintinweb/pi-tasks` source and test suite:
 | Persistent agent memory | Not needed for fire-and-forget delegation. |
 | Full TUI log viewer | `gob tui` or `@juanibiapina/pi-gob` extension covers this. |
 | Agent-to-agent communication | Not supported. Each agent is independent. |
-| Session resume | gob jobs survive but pi sessions don't carry over context. |
+| Extension reattachment after restart | gob jobs survive, but pi-backtask does not currently rebuild its in-memory task map or boomerang old results after a parent Pi restart. |
 
 ---
 
@@ -240,8 +257,8 @@ Verified against `@tintinweb/pi-tasks` source and test suite:
 
 ```
 pi-backtask/
-├── pi-backtask.ts    # Everything — single-file extension (~1.7K lines)
-├── README.md         # Full documentation (~466 lines)
+├── pi-backtask.ts    # Everything — single-file extension (1676 lines)
+├── README.md         # Full documentation (466 lines)
 ├── .gitignore
 └── (no dependencies beyond pi-coding-agent peer)
 ```
@@ -255,7 +272,7 @@ pi-backtask/
 3. **RPC protocol** — search for `subagents:rpc` to see the full compatibility layer
 4. **Result flow** — trace `completeBackgroundTask` → `readFullResult` → branch (RPC emit vs sendMessage)
 5. **Prompt injection** — verify RPC spawn builds args directly (no `parseBgAgentArgs`)
-6. **TypeScript/syntax** — in a Pi dev environment, run `tsc --noEmit --allowImportingTsExtensions --moduleResolution bundler --module esnext --target esnext pi-backtask.ts`; this repo intentionally has no local `package.json`, so a standalone checkout may need explicit TypeScript/node/Pi type dependencies.
+6. **Syntax/static checks** — latest pass used `npx -y esbuild pi-backtask.ts --bundle --platform=node --format=cjs --outfile=/tmp/pi-backtask.js --external:@mariozechner/pi-coding-agent --external:@mariozechner/pi-tui` plus `git diff --check`. A full `tsc` pass needs a Pi dev environment or explicit TypeScript/node/Pi type dependencies because this repo intentionally has no local `package.json`.
 
 ---
 
