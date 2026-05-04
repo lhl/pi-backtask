@@ -324,8 +324,10 @@ Add to `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project):
 | Level | Behavior |
 |-------|----------|
 | `"allow"` | LLM can use freely, no confirmation |
-| `"confirm"` | Hard gate — tool returns a message telling the LLM to ask the user for approval, and provides the equivalent `/bg` command. Does not execute. |
-| `"deny"` | Blocked — tool returns an error telling the LLM to ask the user |
+| `"confirm"` | Hard gate — tool/RPC returns a message telling the LLM to ask the user for approval, and provides the equivalent `/bg` command where applicable. Does not execute. |
+| `"deny"` | Blocked — tool/RPC returns an error telling the LLM to ask the user |
+
+Explicit but invalid policy values fail closed as `"deny"`. Project settings override only the keys they define; unspecified keys inherit from global settings or defaults.
 
 ### Policy Actions
 
@@ -371,6 +373,20 @@ bg_process({ action: "kill", id: 3 })
 ### Background Command Interception
 
 When the tool is enabled, the extension also blocks common bash background patterns (`&`, `nohup`, `disown`, `setsid`) and redirects the LLM to use `bg_process` instead. This prevents the LLM from using shell tricks that would lose process tracking.
+
+## Design and security caveats
+
+pi-backtask is a coordination tool, not a sandbox. The policy system reduces accidental autonomy, but it does not make arbitrary shell access safe.
+
+- **Shell policy can bypass agent policy.** If the LLM can run arbitrary shell commands, it can potentially invoke `pi`, `gob add -- pi ...`, other agent CLIs, network tools, or local scripts. The `agent*` policies gate pi-backtask's RPC agent path; they do not sandbox the `bash` tool or the operating system.
+- **Human slash commands are intentionally outside LLM policy.** `/bg run`, `/bg agent`, and `/bg kill` are human-controlled commands. Policy applies to the LLM-callable `bg_process` tool and pi-tasks RPC spawns.
+- **Background-command interception is best effort.** The bash hook blocks common unmanaged background patterns such as trailing `&`, `nohup`, `disown`, and `setsid`, but it is not a full shell parser or security boundary.
+- **Gob process survival is stronger than extension reattachment.** Gob jobs survive Pi crashes and can be inspected with `gob list`/`gob stdout`; pi-backtask's in-memory task map currently does not reattach old gob jobs after a parent Pi restart. `/bg list`, widgets, and automatic result boomerangs only cover jobs tracked by the current extension instance.
+- **Injected output is untrusted.** Completion and reactive-output notifications wake the parent LLM with text produced by shell commands or child agents. Treat that text like tool output: useful evidence, but not trusted instructions.
+- **Agents share the current working tree by default.** There is no worktree/container isolation. Read-write agents can modify the same files as the parent session.
+- **Polling reads accumulated gob stdout.** Very noisy long-running jobs can make polling/result capture expensive. Prefer patterns for watch mode and inspect huge logs directly with gob.
+
+If you need stronger guarantees, combine pi-backtask with stricter Pi tool settings, disable or gate the built-in `bash` tool, run agents in disposable worktrees/containers, or keep `backtask.tool` disabled and use human-only slash commands.
 
 ### Disabling the Tool Entirely
 
@@ -418,7 +434,7 @@ Do **not** install `@tintinweb/pi-subagents` — pi-backtask replaces it with go
 
 ### Policy enforcement on pi-tasks RPC
 
-The same policy system gates RPC spawns from pi-tasks. Since pi-tasks typically sends generic agent types (e.g., `"general-purpose"`, `"Explore"`), these hit the `agent` policy. With the default `"deny"`, pi-tasks' `TaskExecute` will receive an error — you must explicitly set `"agent": "allow"` (or `"confirm"`) to enable it.
+The same policy system gates RPC spawns from pi-tasks. Since pi-tasks typically sends generic agent types (e.g., `"general-purpose"`, `"Explore"`), these hit the `agent` policy. With the default `"deny"`, pi-tasks' `TaskExecute` will receive an error. Set `"agent": "allow"` to enable automatic TaskExecute spawns. `"confirm"` remains a hard gate: it rejects the RPC spawn and asks for human approval/manual action.
 
 ### Benefits over @tintinweb/pi-subagents
 

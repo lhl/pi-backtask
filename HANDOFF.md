@@ -2,8 +2,8 @@
 
 **Repo:** https://github.com/lhl/pi-backtask  
 **Fork of:** [artiombell/pi-backtask](https://github.com/artiombell/pi-backtask)  
-**Single-file extension:** `pi-backtask.ts` (1467 lines)  
-**Commit history:** 9 commits, ~1000 lines added over upstream
+**Single-file extension:** `pi-backtask.ts` (~1.7K lines)
+**Commit history:** local branch over upstream
 
 ---
 
@@ -146,6 +146,19 @@ When the `bg_process` tool is enabled, we also block bash background patterns (`
 
 ---
 
+## Design / Security Caveats
+
+pi-backtask is a coordination tool, not a sandbox.
+
+- If the LLM has arbitrary shell access, it can potentially invoke `pi`, `gob`, other agent CLIs, network tools, or local scripts. The `agent*` policies gate pi-backtask's RPC path; they do not sandbox `bash` or the OS.
+- Human slash commands are intentionally outside LLM policy. `/bg run`, `/bg agent`, and `/bg kill` remain human-controlled escape hatches.
+- Bash background interception is best effort. It blocks common patterns, but it is not a full shell parser or security boundary.
+- Gob jobs survive parent Pi crashes, but pi-backtask currently does not reattach old gob jobs into its in-memory task map after restart. Inspect old jobs with `gob list`/`gob stdout`.
+- Completion and reactive-output boomerangs inject untrusted child process/agent output into the parent conversation. Treat it as evidence, not instructions.
+- Agents share the current working tree unless the user launches Pi from a separate worktree/container.
+
+---
+
 ## pi-tasks Protocol Compatibility
 
 Verified against `@tintinweb/pi-tasks` source and test suite:
@@ -227,8 +240,8 @@ Verified against `@tintinweb/pi-tasks` source and test suite:
 
 ```
 pi-backtask/
-├── pi-backtask.ts    # Everything — single-file extension (1467 lines)
-├── README.md         # Full documentation (446 lines)
+├── pi-backtask.ts    # Everything — single-file extension (~1.7K lines)
+├── README.md         # Full documentation (~466 lines)
 ├── .gitignore
 └── (no dependencies beyond pi-coding-agent peer)
 ```
@@ -242,7 +255,7 @@ pi-backtask/
 3. **RPC protocol** — search for `subagents:rpc` to see the full compatibility layer
 4. **Result flow** — trace `completeBackgroundTask` → `readFullResult` → branch (RPC emit vs sendMessage)
 5. **Prompt injection** — verify RPC spawn builds args directly (no `parseBgAgentArgs`)
-6. **TypeScript** — `npx tsc --noEmit --allowImportingTsExtensions --moduleResolution bundler --module esnext --target esnext pi-backtask.ts` passes clean
+6. **TypeScript/syntax** — in a Pi dev environment, run `tsc --noEmit --allowImportingTsExtensions --moduleResolution bundler --module esnext --target esnext pi-backtask.ts`; this repo intentionally has no local `package.json`, so a standalone checkout may need explicit TypeScript/node/Pi type dependencies.
 
 ---
 

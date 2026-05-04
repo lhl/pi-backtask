@@ -101,27 +101,72 @@ const DEFAULT_POLICY: BacktaskPolicy = {
 
 const DEFAULT_SETTINGS: BacktaskSettings = {
 	tool: true,
-	policy: DEFAULT_POLICY,
+	policy: { ...DEFAULT_POLICY },
 };
 
-function loadBacktaskSettings(): BacktaskSettings {
-	const locations = [
-		path.join(process.cwd(), ".pi", "settings.json"),
-		path.join(os.homedir(), ".pi", "agent", "settings.json"),
-	];
-	for (const loc of locations) {
-		try {
-			if (!fs.existsSync(loc)) continue;
-			const raw = JSON.parse(fs.readFileSync(loc, "utf8"));
-			const bt = raw?.backtask;
-			if (!bt) continue;
-			return {
-				tool: bt.tool ?? DEFAULT_SETTINGS.tool,
-				policy: { ...DEFAULT_POLICY, ...(bt.policy || {}) },
-			};
-		} catch { /* skip malformed */ }
+const POLICY_KEYS: (keyof BacktaskPolicy)[] = [
+	"shell",
+	"shellWatch",
+	"agent",
+	"agentRw",
+	"agentFull",
+	"kill",
+];
+
+function isPolicyLevel(value: any): value is PolicyLevel {
+	return value === "allow" || value === "confirm" || value === "deny";
+}
+
+function normalizePolicyLevel(value: any): PolicyLevel {
+	// Explicit but invalid policy values should fail closed instead of silently allowing.
+	return isPolicyLevel(value) ? value : "deny";
+}
+
+function applyBacktaskSettings(base: BacktaskSettings, raw: any): BacktaskSettings {
+	const bt = raw?.backtask;
+	if (!bt || typeof bt !== "object") return base;
+
+	const hasTool = Object.prototype.hasOwnProperty.call(bt, "tool");
+	const next: BacktaskSettings = {
+		tool: typeof bt.tool === "boolean" ? bt.tool : hasTool ? false : base.tool,
+		policy: { ...base.policy },
+	};
+
+	const rawPolicy = bt.policy;
+	if (rawPolicy && typeof rawPolicy === "object") {
+		for (const key of POLICY_KEYS) {
+			if (Object.prototype.hasOwnProperty.call(rawPolicy, key)) {
+				next.policy[key] = normalizePolicyLevel(rawPolicy[key]);
+			}
+		}
 	}
-	return DEFAULT_SETTINGS;
+
+	return next;
+}
+
+function readBacktaskSettingsFile(loc: string): any | null {
+	try {
+		if (!fs.existsSync(loc)) return null;
+		return JSON.parse(fs.readFileSync(loc, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+function loadBacktaskSettings(): BacktaskSettings {
+	let settings: BacktaskSettings = {
+		tool: DEFAULT_SETTINGS.tool,
+		policy: { ...DEFAULT_POLICY },
+	};
+
+	// Global settings provide a baseline; project settings override only the keys they define.
+	const globalRaw = readBacktaskSettingsFile(path.join(os.homedir(), ".pi", "agent", "settings.json"));
+	if (globalRaw) settings = applyBacktaskSettings(settings, globalRaw);
+
+	const projectRaw = readBacktaskSettingsFile(path.join(process.cwd(), ".pi", "settings.json"));
+	if (projectRaw) settings = applyBacktaskSettings(settings, projectRaw);
+
+	return settings;
 }
 
 type TaskStatus = "pending" | "in_progress" | "completed";
@@ -157,8 +202,12 @@ interface BackgroundTask {
 	notifyMatcher?: RegExp | null;
 	/** Track how much output we've already alerted on */
 	lastAlertedLength?: number;
+	/** Accumulated output waiting for the debounce timer */
+	pendingAlertOutput?: string;
 	/** Debounce timer for output reactions */
 	outputReactTimer?: any;
+	/** Suppress normal parent-message injection when another protocol owns routing */
+	suppressResultInjection?: boolean;
 }
 
 interface PersistedState {
@@ -485,6 +534,34 @@ export default function (pi: ExtensionAPI) {
 		refreshBackgroundWidget(ctx);
 	}
 
+	function contentToText(content: any): string {
+		if (Array.isArray(content)) {
+			return content
+				.map((block: any) => {
+					if (typeof block === "string") return block;
+					if (block?.type === "text" && typeof block.text === "string") return block.text;
+					if (block?.type === "output_text" && typeof block.text === "string") return block.text;
+					return "";
+				})
+				.filter(Boolean)
+				.join("\n");
+		}
+		if (typeof content === "string") return content;
+		if (content?.text && typeof content.text === "string") return content.text;
+		return "";
+	}
+
+	function assistantTextFromSessionEvent(event: any): string {
+		const candidates = [event?.message, event];
+		for (const candidate of candidates) {
+			if (candidate?.role === "assistant") {
+				const text = contentToText(candidate.content);
+				if (text.trim()) return text;
+			}
+		}
+		return "";
+	}
+
 	/**
 	 * Read the full output from gob stdout on completion (not just the polled tail).
 	 * For agent tasks, also try reading the session file for the final assistant message.
@@ -493,20 +570,14 @@ export default function (pi: ExtensionAPI) {
 		// Try reading the session file for agent tasks (contains full conversation)
 		if (bg.kind === "agent" && bg.sessionFile && fs.existsSync(bg.sessionFile)) {
 			try {
-				const lines = fs.readFileSync(bg.sessionFile, "utf8").trim().split("\n");
-				// Walk backwards to find the last assistant message
+				const raw = fs.readFileSync(bg.sessionFile, "utf8").trim();
+				const lines = raw ? raw.split("\n") : [];
+				// Walk backwards to find the last assistant message. Pi v3 stores it as
+				// { type: "message", message: { role: "assistant", content: [...] } }.
 				for (let i = lines.length - 1; i >= 0; i--) {
 					try {
-						const event = JSON.parse(lines[i]);
-						if (event.role === "assistant" && event.content) {
-							const text = Array.isArray(event.content)
-								? event.content
-									.filter((b: any) => b.type === "text")
-									.map((b: any) => b.text)
-									.join("\n")
-								: String(event.content);
-							if (text.trim()) return text;
-						}
+						const text = assistantTextFromSessionEvent(JSON.parse(lines[i]));
+						if (text.trim()) return text;
 					} catch { /* skip malformed lines */ }
 				}
 			} catch { /* fall through to gob stdout */ }
@@ -526,7 +597,16 @@ export default function (pi: ExtensionAPI) {
 		return bg.outputTail.join("\n");
 	}
 
+	function clearOutputReaction(bg: BackgroundTask) {
+		if (bg.outputReactTimer) {
+			clearTimeout(bg.outputReactTimer);
+			bg.outputReactTimer = null;
+		}
+		bg.pendingAlertOutput = undefined;
+	}
+
 	async function completeBackgroundTask(ctx: ExtensionContext, bg: BackgroundTask, status: BackgroundStatus, exitCode: number | null = null) {
+		clearOutputReaction(bg);
 		bg.status = status;
 		bg.endedAt = Date.now();
 		bg.exitCode = exitCode;
@@ -552,7 +632,7 @@ export default function (pi: ExtensionAPI) {
 		if (subagentId) {
 			// Emit lifecycle events for pi-tasks; it handles its own result routing
 			emitSubagentLifecycleEvent(bg, subagentId, fullResult);
-		} else {
+		} else if (!bg.suppressResultInjection) {
 			// Normal pi-backtask flow: inject result into parent conversation
 			pi.sendMessage(
 				{
@@ -618,32 +698,28 @@ export default function (pi: ExtensionAPI) {
 		if (result.exitCode !== 0) return;
 
 		const fullOutput = result.stdout;
-		const lines = fullOutput
-			.split(/\r?\n/)
-			.map((line) => line.trim())
-			.filter(Boolean);
-		const lastLine = lines[lines.length - 1];
-		if (!lastLine) return;
-		if (bg.lastTailLine === lastLine) return;
-		bg.lastTailLine = lastLine;
-		appendTail(bg, lastLine);
 
-		// Reactive output: check for new output that matches pattern
+		// Reactive output: check all new output before the last-line de-dupe below.
 		if (bg.reactToOutput && ctx && bg.status === "running") {
-			const prevLength = bg.lastAlertedLength || 0;
+			const prevLength = Math.min(bg.lastAlertedLength || 0, fullOutput.length);
 			if (fullOutput.length > prevLength) {
 				const newOutput = fullOutput.slice(prevLength);
-				const shouldNotify = bg.notifyMatcher
-					? bg.notifyMatcher.test(newOutput)
-					: newOutput.trim().length > 0;
+				let shouldNotify = newOutput.trim().length > 0;
+				if (bg.notifyMatcher) {
+					bg.notifyMatcher.lastIndex = 0;
+					shouldNotify = bg.notifyMatcher.test(newOutput);
+					bg.notifyMatcher.lastIndex = 0;
+				}
 
 				if (shouldNotify) {
-					// Debounce: wait 2s for more output to accumulate
+					bg.pendingAlertOutput = `${bg.pendingAlertOutput || ""}${newOutput}`;
+					// Debounce: wait 2s for more output to accumulate.
 					if (bg.outputReactTimer) clearTimeout(bg.outputReactTimer);
 					bg.outputReactTimer = setTimeout(() => {
 						bg.outputReactTimer = null;
-						const alertOutput = fullOutput.slice(bg.lastAlertedLength || 0);
-						bg.lastAlertedLength = fullOutput.length;
+						const alertOutput = bg.pendingAlertOutput || "";
+						bg.pendingAlertOutput = undefined;
+						if (bg.status !== "running" || !alertOutput.trim()) return;
 						const patternNote = bg.notifyPattern ? ` (matched: ${bg.notifyPattern})` : "";
 						pi.sendMessage(
 							{
@@ -655,10 +731,20 @@ export default function (pi: ExtensionAPI) {
 						);
 					}, 2000);
 				}
-				// Update alerted length even if debounced (prevents duplicate alerts)
+				// Advance even when output does not match; future alerts should only consider future output.
 				bg.lastAlertedLength = fullOutput.length;
 			}
 		}
+
+		const lines = fullOutput
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter(Boolean);
+		const lastLine = lines[lines.length - 1];
+		if (!lastLine) return;
+		if (bg.lastTailLine === lastLine) return;
+		bg.lastTailLine = lastLine;
+		appendTail(bg, lastLine);
 	}
 
 	function stopGobPollingIfIdle() {
@@ -724,7 +810,9 @@ export default function (pi: ExtensionAPI) {
 		description: string,
 		command: string,
 		args: string[],
-		sessionFile?: string
+		sessionFile?: string,
+		suppressResultInjection = false,
+		onStarted?: (bg: BackgroundTask) => void
 	): Promise<BackgroundTask | null> {
 		const id = nextBgId++;
 		const bg: BackgroundTask = {
@@ -735,6 +823,7 @@ export default function (pi: ExtensionAPI) {
 			startedAt: Date.now(),
 			outputTail: [],
 			sessionFile,
+			suppressResultInjection,
 		};
 		backgroundTasks.set(id, bg);
 		refreshAll(ctx);
@@ -758,7 +847,7 @@ export default function (pi: ExtensionAPI) {
 		if (addResult.exitCode !== 0) {
 			appendTail(bg, addResult.stderr || addResult.stdout || "gob add failed");
 			await completeBackgroundTask(ctx, bg, "failed", addResult.exitCode);
-			return bg;
+			return null;
 		}
 
 		const output = `${addResult.stdout}\n${addResult.stderr}`;
@@ -776,11 +865,12 @@ export default function (pi: ExtensionAPI) {
 		if (!jobId) {
 			appendTail(bg, output || "unable to determine gob job id");
 			await completeBackgroundTask(ctx, bg, "failed", null);
-			return bg;
+			return null;
 		}
 
 		bg.gobJobId = jobId;
 		appendTail(bg, `gob job ${jobId} started`);
+		onStarted?.(bg);
 		refreshAll(ctx);
 		ensureGobPolling(ctx);
 		return bg;
@@ -810,6 +900,61 @@ export default function (pi: ExtensionAPI) {
 		return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
 	}
 
+	interface ShellLikeToken {
+		token: string;
+		start: number;
+		end: number;
+	}
+
+	function readShellLikeToken(input: string, start = 0): ShellLikeToken | null {
+		let i = start;
+		while (i < input.length && /\s/.test(input[i])) i++;
+		if (i >= input.length) return null;
+
+		const tokenStart = i;
+		let token = "";
+		let quote: string | null = null;
+		let escaped = false;
+
+		for (; i < input.length; i++) {
+			const ch = input[i];
+			if (escaped) {
+				token += ch;
+				escaped = false;
+				continue;
+			}
+			if (ch === "\\" && quote !== "'") {
+				escaped = true;
+				continue;
+			}
+			if (quote) {
+				if (ch === quote) quote = null;
+				else token += ch;
+				continue;
+			}
+			if (ch === "'" || ch === '"') {
+				quote = ch;
+				continue;
+			}
+			if (/\s/.test(ch)) break;
+			token += ch;
+		}
+
+		if (escaped) token += "\\";
+		return { token, start: tokenStart, end: i };
+	}
+
+	function stripSingleShellLikeToken(input: string): string {
+		const trimmed = input.trim();
+		const parsed = readShellLikeToken(trimmed, 0);
+		if (parsed && trimmed.slice(parsed.end).trim() === "") return parsed.token;
+		return trimmed;
+	}
+
+	function quoteSlashArg(value: string): string {
+		return JSON.stringify(value);
+	}
+
 	/**
 	 * Parse /bg run options. Supports:
 	 *   /bg run <command>
@@ -817,18 +962,31 @@ export default function (pi: ExtensionAPI) {
 	 *   /bg run --watch --pattern <p> <command> (notify only on matching output)
 	 */
 	function parseBgRunArgs(raw: string): { command: string; watch: boolean; pattern?: string } {
-		const tokens = raw.split(/\s+/);
 		let watch = false;
 		let pattern: string | undefined;
-		const rest: string[] = [];
+		let position = 0;
 
-		for (let i = 0; i < tokens.length; i++) {
-			const t = tokens[i];
-			if (t === "--watch") { watch = true; continue; }
-			if (t === "--pattern" && i + 1 < tokens.length) { pattern = tokens[++i]; watch = true; continue; }
-			rest.push(t);
+		while (true) {
+			const parsed = readShellLikeToken(raw, position);
+			if (!parsed) return { command: "", watch, pattern };
+			if (parsed.token === "--watch") {
+				watch = true;
+				position = parsed.end;
+				continue;
+			}
+			if (parsed.token === "--pattern") {
+				const value = readShellLikeToken(raw, parsed.end);
+				if (!value) return { command: "", watch: true, pattern };
+				pattern = value.token;
+				watch = true;
+				position = value.end;
+				continue;
+			}
+			if (parsed.token === "--") {
+				return { command: stripSingleShellLikeToken(raw.slice(parsed.end)), watch, pattern };
+			}
+			return { command: stripSingleShellLikeToken(raw.slice(parsed.start)), watch, pattern };
 		}
-		return { command: rest.join(" "), watch, pattern };
 	}
 
 	async function spawnShellBackground(ctx: ExtensionContext, command: string, watch = false, pattern?: string) {
@@ -852,22 +1010,42 @@ export default function (pi: ExtensionAPI) {
 	 *   /bg agent --full <prompt>         (all tools + extensions + thinking)
 	 */
 	function parseBgAgentArgs(raw: string): { prompt: string; rw: boolean; model?: string; think: boolean; full: boolean } {
-		const tokens = raw.split(/\s+/);
 		let rw = false;
 		let think = false;
 		let full = false;
 		let model: string | undefined;
-		const rest: string[] = [];
+		let position = 0;
 
-		for (let i = 0; i < tokens.length; i++) {
-			const t = tokens[i];
-			if (t === "--rw") { rw = true; continue; }
-			if (t === "--think") { think = true; continue; }
-			if (t === "--full") { full = true; continue; }
-			if (t === "--model" && i + 1 < tokens.length) { model = tokens[++i]; continue; }
-			rest.push(t);
+		while (true) {
+			const parsed = readShellLikeToken(raw, position);
+			if (!parsed) return { prompt: "", rw, model, think, full };
+			if (parsed.token === "--rw") {
+				rw = true;
+				position = parsed.end;
+				continue;
+			}
+			if (parsed.token === "--think") {
+				think = true;
+				position = parsed.end;
+				continue;
+			}
+			if (parsed.token === "--full") {
+				full = true;
+				position = parsed.end;
+				continue;
+			}
+			if (parsed.token === "--model") {
+				const value = readShellLikeToken(raw, parsed.end);
+				if (!value) return { prompt: "", rw, model, think, full };
+				model = value.token;
+				position = value.end;
+				continue;
+			}
+			if (parsed.token === "--") {
+				return { prompt: stripSingleShellLikeToken(raw.slice(parsed.end)), rw, model, think, full };
+			}
+			return { prompt: stripSingleShellLikeToken(raw.slice(parsed.start)), rw, model, think, full };
 		}
-		return { prompt: rest.join(" "), rw, model, think, full };
 	}
 
 	async function spawnAgentBackground(ctx: ExtensionContext, rawArgs: string) {
@@ -1170,13 +1348,16 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 				}
 
 				if (params.action === "kill") {
+					const id = params.id;
+					if (!id) {
+						return { content: [{ type: "text", text: "Error: 'id' is required for kill action." }], details: {} };
+					}
 					const policy = settings.policy.kill;
 					if (policy === "deny") {
 						return { content: [{ type: "text", text: "Denied: kill action is not allowed by policy." }], details: {} };
 					}
-					const id = params.id;
-					if (!id) {
-						return { content: [{ type: "text", text: "Error: 'id' is required for kill action." }], details: {} };
+					if (policy === "confirm") {
+						return { content: [{ type: "text", text: `Confirmation required: ask the user to approve stopping background task #${id}. If approved, the user can run: /bg kill ${id}` }], details: {} };
 					}
 					const bg = backgroundTasks.get(id);
 					if (!bg) {
@@ -1216,7 +1397,7 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 						// Hard gate: tell the LLM it must get user approval first
 						ctx.ui.notify(`bg_process wants to run: ${command.slice(0, 80)}`, "warning");
 						return {
-							content: [{ type: "text", text: `Confirmation required: ask the user to approve running this command in background:\n\n  ${command}${watch ? `\n  (with reactive output${pattern ? `: ${pattern}` : ""})` : ""}\n\nIf approved, the user can run: /bg run ${watch ? "--watch " : ""}${pattern ? `--pattern "${pattern}" ` : ""}"${command}"` }],
+							content: [{ type: "text", text: `Confirmation required: ask the user to approve running this command in background:\n\n  ${command}${watch ? `\n  (with reactive output${pattern ? `: ${pattern}` : ""})` : ""}\n\nIf approved, the user can run: /bg run ${watch ? "--watch " : ""}${pattern ? `--pattern ${quoteSlashArg(pattern)} ` : ""}${quoteSlashArg(command)}` }],
 							details: {},
 						};
 					}
@@ -1238,18 +1419,18 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 	}
 
 	// ─── Block bash background patterns (optional, when tool is enabled) ────
-	if (settings.tool && settings.policy.shell !== "deny") {
+	if (settings.tool) {
 		pi.on("tool_call", async (event, ctx) => {
 			if (event.toolName !== "bash") return;
 			const command = String((event as any).input?.command ?? "");
 			// Detect common background patterns
 			if (/&\s*$/.test(command) || /\b(nohup|disown|setsid)\b/.test(command)) {
-				return {
-					block: true,
-					reason: "Background shell patterns (&, nohup, disown, setsid) are not supported. " +
+				const reason = settings.policy.shell === "deny"
+					? "Background shell patterns (&, nohup, disown, setsid) are blocked because background shell commands are denied by backtask policy."
+					: "Background shell patterns (&, nohup, disown, setsid) are not supported. " +
 						'Use the bg_process tool with action "run" to run commands in the background. ' +
-						'Example: bg_process({ action: "run", command: "npm run dev", watch: true })',
-				};
+						'Example: bg_process({ action: "run", command: "npm run dev", watch: true })';
+				return { block: true, reason };
 			}
 			return undefined;
 		});
@@ -1310,8 +1491,13 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 			});
 			return;
 		}
-		if (policy === "confirm" && ctxRef) {
-			ctxRef.ui.notify(`pi-tasks spawn (${policyKey}): ${prompt.slice(0, 80)}`, "warning");
+		if (policy === "confirm") {
+			ctxRef.ui.notify(`pi-tasks spawn requires approval (${policyKey}): ${prompt.slice(0, 80)}`, "warning");
+			pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
+				success: false,
+				error: `Confirmation required by policy: ${policyKey} is set to confirm. Ask the user to run /bg agent manually or change policy to allow.`,
+			});
+			return;
 		}
 
 		// Spawn directly rather than going through parseBgAgentArgs
@@ -1345,6 +1531,7 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 
 		piArgs.push(prompt);
 
+		let agentId: string | undefined;
 		const bg = await spawnGobBackground(
 			ctxRef,
 			"agent",
@@ -1352,20 +1539,21 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 			description,
 			"pi",
 			piArgs,
-			sessionFile
+			sessionFile,
+			true,
+			(startedBg) => {
+				agentId = `backtask-agent-${startedBg.id}`;
+				subagentBgMap.set(agentId, startedBg.id);
+			}
 		);
 
-		if (!bg) {
+		if (!bg || bg.status !== "running" || !bg.gobJobId || !agentId) {
 			pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
 				success: false,
 				error: "Failed to spawn background agent",
 			});
 			return;
 		}
-
-		// Use a stable agent ID that pi-tasks can track
-		const agentId = `backtask-agent-${bg.id}`;
-		subagentBgMap.set(agentId, bg.id);
 
 		pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, {
 			success: true,
@@ -1377,6 +1565,15 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 	pi.events.on("subagents:rpc:stop", async (data: any) => {
 		const { requestId, agentId } = data || {};
 		if (!requestId) return;
+
+		const activeCtx = ctxRef;
+		if (!activeCtx) {
+			pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, {
+				success: false,
+				error: "No active session context",
+			});
+			return;
+		}
 
 		const bgId = subagentBgMap.get(agentId);
 		const bg = bgId != null ? backgroundTasks.get(bgId) : undefined;
@@ -1397,6 +1594,10 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 			});
 			return;
 		}
+
+		appendTail(bg, stopResult.stdout || `stopped gob job ${bg.gobJobId}`);
+		await completeBackgroundTask(activeCtx, bg, "killed", null);
+		stopGobPollingIfIdle();
 
 		pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, {
 			success: true,
@@ -1427,7 +1628,12 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 			});
 		} else if (bg.status === "failed") {
 			const error = bg.outputTail[bg.outputTail.length - 1] || "Agent failed";
-			pi.events.emit("subagents:failed", { id: agentId, error });
+			pi.events.emit("subagents:failed", {
+				id: agentId,
+				error,
+				result: fullResult.slice(-12000),
+				status: "failed",
+			});
 		}
 
 		subagentBgMap.delete(agentId);
@@ -1457,6 +1663,9 @@ Use watch+pattern for test runners, dev servers, and builds where you want to re
 
 	pi.on("session_shutdown", async () => {
 		persist();
+		for (const bg of backgroundTasks.values()) {
+			clearOutputReaction(bg);
+		}
 		if (gobPollTimer) {
 			clearInterval(gobPollTimer);
 			gobPollTimer = undefined;
