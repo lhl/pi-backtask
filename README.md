@@ -1,5 +1,13 @@
 # pi-backtask
 
+> [!NOTE]
+> This repository is an experimental, work-in-progress fork of
+> [`artiombell/pi-backtask`](https://github.com/artiombell/pi-backtask). It has
+> not been fully tested and should not be treated as production-ready. The
+> [`lhl/devstack`](https://github.com/lhl/devstack) setup currently uses
+> [`@vanillagreen/pi-background-tasks`](https://www.npmjs.com/package/@vanillagreen/pi-background-tasks)
+> for background tasks instead.
+
 `pi-backtask` is a Pi Coding Agent extension that adds two Claude Code style workflows:
 
 1. Persistent task list management (`/task ...`)
